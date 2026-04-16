@@ -41,6 +41,7 @@ struct VehicleState {
     connected: bool,
     sim_mode: bool,
     camera_count: usize,
+    active_camera: usize,
 }
 
 impl Default for VehicleState {
@@ -57,6 +58,7 @@ impl Default for VehicleState {
             connected: false,
             sim_mode: true,
             camera_count: 0,
+            active_camera: 0,
         }
     }
 }
@@ -154,6 +156,7 @@ impl MapTileCache {
         let half_w = (width / 2) as i32;
         let half_h = (height / 2) as i32;
 
+        // Render 3x3 grid of tiles centered on current position
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
                 let ttx = (tile_ix as i32 + dx) as u32;
@@ -172,6 +175,18 @@ impl MapTileCache {
                         }
                     }
                 }
+            }
+        }
+        
+        // Pre-fetch outer ring of tiles (5x5 minus inner 3x3) in background
+        for dy in -2i32..=2 {
+            for dx in -2i32..=2 {
+                if dy.abs() <= 1 && dx.abs() <= 1 {
+                    continue; // Skip already-fetched inner 3x3
+                }
+                let ttx = (tile_ix as i32 + dx) as u32;
+                let tty = (tile_iy as i32 + dy) as u32;
+                let _ = self.fetch_tile(ttx, tty); // Pre-cache
             }
         }
 
@@ -266,6 +281,7 @@ struct CameraHandler {
     frame: Arc<Mutex<Option<CameraFrame>>>,
     running: Arc<Mutex<bool>>,
     camera_count: Arc<Mutex<usize>>,
+    active_index: Arc<Mutex<usize>>,
 }
 
 impl CameraHandler {
@@ -274,15 +290,22 @@ impl CameraHandler {
             frame: Arc::new(Mutex::new(None)),
             running: Arc::new(Mutex::new(false)),
             camera_count: Arc::new(Mutex::new(0)),
+            active_index: Arc::new(Mutex::new(0)),
         }
     }
 
     #[cfg(windows)]
-    fn start(&self, logs: Arc<Mutex<Vec<String>>>) {
+    fn start(&self, logs: Arc<Mutex<Vec<String>>>, camera_index: usize) {
+        // Stop any existing capture
+        self.stop();
+        std::thread::sleep(Duration::from_millis(100));
+        
         let frame = self.frame.clone();
         let running = self.running.clone();
         let camera_count = self.camera_count.clone();
+        let active_index = self.active_index.clone();
         *running.lock().unwrap() = true;
+        *active_index.lock().unwrap() = camera_index;
 
         std::thread::spawn(move || {
             // Count available devices
@@ -290,7 +313,7 @@ impl CameraHandler {
             *camera_count.lock().unwrap() = device_count;
             
             if let Ok(mut l) = logs.lock() {
-                l.push(format!("[{}] ESCAPI: {} camera(s) found", timestamp(), device_count));
+                l.push(format!("[{}] ESCAPI: {} camera(s) detected", timestamp(), device_count));
             }
             
             if device_count == 0 {
@@ -300,16 +323,18 @@ impl CameraHandler {
                 return;
             }
             
-            // Try to open first camera
+            // Clamp camera index to valid range
+            let idx = camera_index.min(device_count.saturating_sub(1));
+            
             let width: u32 = 320;
             let height: u32 = 240;
             let fps: u64 = 30;
             
-            match escapi::init(0, width, height, fps) {
+            match escapi::init(idx, width, height, fps) {
                 Ok(camera) => {
                     let name = camera.name();
                     if let Ok(mut l) = logs.lock() {
-                        l.push(format!("[{}] Opened camera: {}", timestamp(), name));
+                        l.push(format!("[{}] Camera {}: {}", timestamp(), idx, name));
                     }
                     
                     while *running.lock().unwrap() {
@@ -337,7 +362,7 @@ impl CameraHandler {
                 }
                 Err(e) => {
                     if let Ok(mut l) = logs.lock() {
-                        l.push(format!("[{}] Failed to open camera: {}", timestamp(), e));
+                        l.push(format!("[{}] Failed to open camera {}: {}", timestamp(), idx, e));
                     }
                 }
             }
@@ -345,9 +370,9 @@ impl CameraHandler {
     }
 
     #[cfg(not(windows))]
-    fn start(&self, logs: Arc<Mutex<Vec<String>>>) {
+    fn start(&self, logs: Arc<Mutex<Vec<String>>>, _camera_index: usize) {
         if let Ok(mut l) = logs.lock() {
-            l.push(format!("[{}] Camera support is Windows-only in this build", timestamp()));
+            l.push(format!("[{}] Camera support is Windows-only", timestamp()));
         }
     }
 
@@ -385,6 +410,8 @@ struct EVControlApp {
     last_map_update: Instant,
     estop_pressed: bool,
     reset_pressed: bool,
+    reconnect_all: bool,
+    switch_camera: bool,
 }
 
 impl EVControlApp {
@@ -394,7 +421,7 @@ impl EVControlApp {
         {
             let mut l = logs.lock().unwrap();
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
-            l.push(format!("[{}] EV Prototype Control Center v1.2", timestamp()));
+            l.push(format!("[{}] EV Prototype Control Center v1.3", timestamp()));
             l.push(format!("[{}] Texas A&M FLiNT - Team Autopilot", timestamp()));
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
         }
@@ -406,7 +433,7 @@ impl EVControlApp {
         };
         
         let camera = CameraHandler::new();
-        camera.start(logs.clone());
+        camera.start(logs.clone(), 0);
 
         Self {
             state: VehicleState {
@@ -424,6 +451,8 @@ impl EVControlApp {
             last_map_update: Instant::now(),
             estop_pressed: false,
             reset_pressed: false,
+            reconnect_all: false,
+            switch_camera: false,
         }
     }
 
@@ -740,9 +769,18 @@ impl EVControlApp {
                 self.reset_pressed = true;
             }
             if ui.button("🔌 Reconnect").clicked() {
-                let mut logs_vec = self.logs.lock().unwrap();
-                self.state.connected = self.serial.find_and_connect(&mut logs_vec);
+                self.reconnect_all = true;
             }
+        });
+        
+        ui.horizontal(|ui| {
+            let cam_count = self.state.camera_count;
+            if cam_count > 1 {
+                if ui.button(format!("📷 Cam {} →", self.state.active_camera)).clicked() {
+                    self.switch_camera = true;
+                }
+            }
+            ui.label(RichText::new(format!("{} cam(s)", cam_count)).small().weak());
         });
 
         ui.add_space(4.0);
@@ -823,10 +861,29 @@ impl eframe::App for EVControlApp {
             self.state = VehicleState {
                 connected: self.state.connected,
                 camera_count: self.state.camera_count,
+                active_camera: self.state.active_camera,
                 ..Default::default()
             };
             self.log("Reset");
             self.reset_pressed = false;
+        }
+        
+        if self.reconnect_all {
+            self.log("Reconnecting all devices...");
+            {
+                let mut logs_vec = self.logs.lock().unwrap();
+                self.state.connected = self.serial.find_and_connect(&mut logs_vec);
+            }
+            self.camera.start(self.logs.clone(), self.state.active_camera);
+            self.reconnect_all = false;
+        }
+        
+        if self.switch_camera {
+            let next = (self.state.active_camera + 1) % self.state.camera_count.max(1);
+            self.state.active_camera = next;
+            self.log(&format!("Switching to camera {}", next));
+            self.camera.start(self.logs.clone(), next);
+            self.switch_camera = false;
         }
 
         if !self.state.auto_mode {
