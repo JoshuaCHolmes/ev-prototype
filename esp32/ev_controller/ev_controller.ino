@@ -13,6 +13,9 @@
 
 #include <ArduinoJson.h>
 
+// Firmware version - must match GUI expected version
+#define FIRMWARE_VERSION "1.5.3"
+
 // Pins - ALL TOP ROW (column j on breadboard)
 #define THROTTLE_DAC 25      // DAC output (row 8) → controller BROWN
 #define BRAKE_PIN 32         // Active LOW (row 10) → controller PURPLE
@@ -52,7 +55,9 @@ void setup() {
     ledcWrite(0, 0);
     
     Serial.println("ESP32 EV Ready (L298N Steering)");
-    Serial.println("Commands: {\"t\":0-100, \"s\":-100 to 100, \"b\":true/false}");
+    Serial.print("VERSION:");
+    Serial.println(FIRMWARE_VERSION);
+    Serial.println("Commands: {\"t\":0-100, \"s\":-100 to 100, \"b\":true/false, \"v\":true}");
 }
 
 void setThrottle(int pct) {
@@ -103,6 +108,13 @@ void setBrake(bool on) {
 void processCommand(String& json) {
     StaticJsonDocument<128> doc;
     if (deserializeJson(doc, json)) return;
+    
+    // Version query
+    if (doc.containsKey("v") && doc["v"].as<bool>()) {
+        Serial.print("VERSION:");
+        Serial.println(FIRMWARE_VERSION);
+        return;
+    }
     
     if (doc.containsKey("t")) setThrottle(doc["t"].as<int>());
     if (doc.containsKey("s")) setSteering(doc["s"].as<int>());

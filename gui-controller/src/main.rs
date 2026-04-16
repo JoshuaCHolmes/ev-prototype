@@ -12,7 +12,7 @@ use image::{DynamicImage, RgbImage};
 use serde::Serialize;
 use serialport::SerialPort;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -687,13 +687,18 @@ impl MapTileCache {
 struct SerialController {
     port: Option<Box<dyn SerialPort>>,
     port_name: String,
+    firmware_version: Option<String>,
 }
+
+// Expected firmware version - update when ESP32 code changes
+const EXPECTED_FIRMWARE_VERSION: &str = "1.5.3";
 
 impl SerialController {
     fn new() -> Self {
         Self {
             port: None,
             port_name: String::new(),
+            firmware_version: None,
         }
     }
 
@@ -735,6 +740,10 @@ impl SerialController {
                 self.port = Some(port);
                 logs.push(format!("[{}] Connected! Waiting for ESP32 reset...", timestamp()));
                 std::thread::sleep(Duration::from_secs(2));
+                
+                // Check firmware version
+                self.check_firmware_version(logs);
+                
                 logs.push(format!("[{}] ESP32 ready", timestamp()));
                 true
             }
@@ -743,6 +752,42 @@ impl SerialController {
                 false
             }
         }
+    }
+    
+    fn check_firmware_version(&mut self, logs: &mut Vec<String>) {
+        if let Some(ref mut port) = self.port {
+            // Request version
+            let _ = port.write_all(b"{\"v\":true}\n");
+            std::thread::sleep(Duration::from_millis(200));
+            
+            // Read response
+            let mut buf = [0u8; 256];
+            if let Ok(n) = port.read(&mut buf) {
+                let response = String::from_utf8_lossy(&buf[..n]);
+                for line in response.lines() {
+                    if let Some(version) = line.strip_prefix("VERSION:") {
+                        let ver = version.trim().to_string();
+                        logs.push(format!("[{}] ESP32 firmware: v{}", timestamp(), ver));
+                        
+                        if ver != EXPECTED_FIRMWARE_VERSION {
+                            logs.push(format!("[{}] ⚠️ FIRMWARE MISMATCH! Expected v{}, got v{}", 
+                                timestamp(), EXPECTED_FIRMWARE_VERSION, ver));
+                            logs.push(format!("[{}] Please update ESP32 firmware", timestamp()));
+                        } else {
+                            logs.push(format!("[{}] ✓ Firmware version OK", timestamp()));
+                        }
+                        
+                        self.firmware_version = Some(ver);
+                        return;
+                    }
+                }
+            }
+            logs.push(format!("[{}] Could not read firmware version (may be old firmware)", timestamp()));
+        }
+    }
+    
+    fn firmware_ok(&self) -> bool {
+        self.firmware_version.as_ref().map(|v| v == EXPECTED_FIRMWARE_VERSION).unwrap_or(false)
     }
 
     fn send(&mut self, throttle: i32, steering: i32, brake: bool) {
@@ -1476,6 +1521,24 @@ impl EVControlApp {
             if ui.add(egui::Button::new(RichText::new(auto_text).color(auto_color))).clicked() {
                 self.state.auto_mode = !self.state.auto_mode;
                 self.log(if self.state.auto_mode { "AUTO mode" } else { "MANUAL mode" });
+            }
+        });
+        
+        // Firmware status
+        ui.horizontal(|ui| {
+            if self.serial.port.is_some() {
+                if let Some(ref ver) = self.serial.firmware_version {
+                    if self.serial.firmware_ok() {
+                        ui.label(RichText::new(format!("✓ ESP32 v{}", ver)).color(Color32::GREEN).small());
+                    } else {
+                        ui.label(RichText::new(format!("⚠ ESP32 v{} (need {})", ver, EXPECTED_FIRMWARE_VERSION))
+                            .color(Color32::YELLOW).small());
+                    }
+                } else {
+                    ui.label(RichText::new("? ESP32 (old firmware)").color(Color32::YELLOW).small());
+                }
+            } else {
+                ui.label(RichText::new("⊘ ESP32 offline").color(Color32::RED).small());
             }
         });
         
