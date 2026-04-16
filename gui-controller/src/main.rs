@@ -285,12 +285,12 @@ impl CameraHandler {
         *running.lock().unwrap() = true;
 
         std::thread::spawn(move || {
-            // Initialize escapi
-            let device_count = escapi::init();
-            *camera_count.lock().unwrap() = device_count as usize;
+            // Count available devices
+            let device_count = escapi::num_devices();
+            *camera_count.lock().unwrap() = device_count;
             
             if let Ok(mut l) = logs.lock() {
-                l.push(format!("[{}] ESCAPI initialized: {} camera(s)", timestamp(), device_count));
+                l.push(format!("[{}] ESCAPI: {} camera(s) found", timestamp(), device_count));
             }
             
             if device_count == 0 {
@@ -301,13 +301,14 @@ impl CameraHandler {
             }
             
             // Try to open first camera
-            let width = 320;
-            let height = 240;
+            let width: u32 = 320;
+            let height: u32 = 240;
+            let fps: u64 = 30;
             
-            match escapi::Device::new(0, width, height) {
-                Ok(mut camera) => {
+            match escapi::init(0, width, height, fps) {
+                Ok(camera) => {
+                    let name = camera.name();
                     if let Ok(mut l) = logs.lock() {
-                        let name = escapi::device_name(0).unwrap_or_else(|| "Unknown".to_string());
                         l.push(format!("[{}] Opened camera: {}", timestamp(), name));
                     }
                     
@@ -316,7 +317,7 @@ impl CameraHandler {
                             // escapi returns BGRA, convert to RGB
                             let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
                             for chunk in pixels.chunks(4) {
-                                if chunk.len() >= 3 {
+                                if chunk.len() >= 4 {
                                     rgb_data.push(chunk[2]); // R
                                     rgb_data.push(chunk[1]); // G
                                     rgb_data.push(chunk[0]); // B
@@ -336,7 +337,7 @@ impl CameraHandler {
                 }
                 Err(e) => {
                     if let Ok(mut l) = logs.lock() {
-                        l.push(format!("[{}] Failed to open camera: {:?}", timestamp(), e));
+                        l.push(format!("[{}] Failed to open camera: {}", timestamp(), e));
                     }
                 }
             }
