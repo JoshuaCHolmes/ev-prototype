@@ -14,7 +14,7 @@
 #include <ArduinoJson.h>
 
 // Firmware version - must match GUI expected version
-#define FIRMWARE_VERSION "1.5.5"
+#define FIRMWARE_VERSION "1.5.6"
 
 // Pins - ALL TOP ROW (column j on breadboard)
 #define THROTTLE_DAC 25      // DAC output (row 8) → controller BROWN

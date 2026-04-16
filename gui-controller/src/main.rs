@@ -691,7 +691,7 @@ struct SerialController {
 }
 
 // Expected firmware version - update when ESP32 code changes
-const EXPECTED_FIRMWARE_VERSION: &str = "1.5.5";
+const EXPECTED_FIRMWARE_VERSION: &str = "1.5.6";
 
 impl SerialController {
     fn new() -> Self {
@@ -788,6 +788,115 @@ impl SerialController {
     
     fn firmware_ok(&self) -> bool {
         self.firmware_version.as_ref().map(|v| v == EXPECTED_FIRMWARE_VERSION).unwrap_or(false)
+    }
+    
+    fn disconnect(&mut self) {
+        self.port = None;
+        self.firmware_version = None;
+    }
+    
+    fn flash_firmware(&mut self, logs: &mut Vec<String>) -> bool {
+        // Only flash if we have a port name (even if disconnected for flashing)
+        if self.port_name.is_empty() {
+            logs.push(format!("[{}] No ESP32 port known - connect first", timestamp()));
+            return false;
+        }
+        
+        // Close port before flashing
+        self.port = None;
+        logs.push(format!("[{}] Downloading firmware v{}...", timestamp(), EXPECTED_FIRMWARE_VERSION));
+        
+        // Download firmware from GitHub releases
+        let firmware_url = format!(
+            "https://github.com/JoshuaCHolmes/ev-prototype/releases/download/v{}/firmware-esp32.bin",
+            EXPECTED_FIRMWARE_VERSION
+        );
+        
+        let cache_dir = directories::ProjectDirs::from("edu", "tamu", "ev-prototype")
+            .map(|d| d.cache_dir().to_path_buf())
+            .unwrap_or_else(|| std::env::temp_dir());
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let firmware_path = cache_dir.join("firmware-esp32.bin");
+        
+        // Download firmware
+        let client = reqwest::blocking::Client::new();
+        match client.get(&firmware_url)
+            .header("User-Agent", "EV-Prototype-GUI")
+            .send()
+        {
+            Ok(response) if response.status().is_success() => {
+                match response.bytes() {
+                    Ok(bytes) => {
+                        if let Err(e) = std::fs::write(&firmware_path, &bytes) {
+                            logs.push(format!("[{}] Failed to save firmware: {}", timestamp(), e));
+                            return false;
+                        }
+                        logs.push(format!("[{}] Downloaded {} bytes", timestamp(), bytes.len()));
+                    }
+                    Err(e) => {
+                        logs.push(format!("[{}] Download failed: {}", timestamp(), e));
+                        return false;
+                    }
+                }
+            }
+            Ok(response) => {
+                logs.push(format!("[{}] Download failed: HTTP {}", timestamp(), response.status()));
+                return false;
+            }
+            Err(e) => {
+                logs.push(format!("[{}] Download failed: {}", timestamp(), e));
+                return false;
+            }
+        }
+        
+        logs.push(format!("[{}] Flashing to {}...", timestamp(), self.port_name));
+        
+        // Try esptool via Python
+        let flash_result = std::process::Command::new("python")
+            .args([
+                "-m", "esptool",
+                "--chip", "esp32",
+                "--port", &self.port_name,
+                "--baud", "921600",
+                "write_flash", "0x10000",
+                firmware_path.to_str().unwrap_or("firmware.bin")
+            ])
+            .output();
+        
+        match flash_result {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                
+                if output.status.success() || stdout.contains("Hash of data verified") {
+                    logs.push(format!("[{}] ✓ Flash complete!", timestamp()));
+                    logs.push(format!("[{}] Reconnecting...", timestamp()));
+                    std::thread::sleep(Duration::from_secs(2));
+                    return self.connect(logs);
+                } else {
+                    logs.push(format!("[{}] Flash failed: {}", timestamp(), stderr.lines().next().unwrap_or("unknown error")));
+                    // Try with python3
+                    let retry = std::process::Command::new("python3")
+                        .args(["-m", "esptool", "--chip", "esp32", "--port", &self.port_name, 
+                               "--baud", "921600", "write_flash", "0x10000", 
+                               firmware_path.to_str().unwrap_or("firmware.bin")])
+                        .output();
+                    if let Ok(out) = retry {
+                        if out.status.success() {
+                            logs.push(format!("[{}] ✓ Flash complete!", timestamp()));
+                            std::thread::sleep(Duration::from_secs(2));
+                            return self.connect(logs);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                logs.push(format!("[{}] esptool not found: {}", timestamp(), e));
+                logs.push(format!("[{}] Install with: pip install esptool", timestamp()));
+            }
+        }
+        
+        false
     }
 
     fn send(&mut self, throttle: i32, steering: i32, brake: bool) {
@@ -944,6 +1053,7 @@ struct EVControlApp {
     reconnect_all: bool,
     switch_camera: bool,
     toggle_sim: bool,
+    flash_firmware: bool,
     // FSD Navigation
     nav: NavigationSystem,
     nav_search_open: bool,
@@ -956,7 +1066,7 @@ impl EVControlApp {
         {
             let mut l = logs.lock().unwrap();
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
-            l.push(format!("[{}] EV Prototype Control Center v1.5.2", timestamp()));
+            l.push(format!("[{}] EV Prototype Control Center v1.5.6", timestamp()));
             l.push(format!("[{}] Texas A&M FLiNT - Team Autopilot", timestamp()));
             l.push(format!("[{}] Microtransport FSD - Sidewalk Priority", timestamp()));
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
@@ -990,6 +1100,7 @@ impl EVControlApp {
             reconnect_all: false,
             switch_camera: false,
             toggle_sim: false,
+            flash_firmware: false,
             nav: NavigationSystem::new(),
             nav_search_open: false,
         }
@@ -1532,14 +1643,14 @@ impl EVControlApp {
                         ui.label(RichText::new(format!("✓ ESP32 v{}", ver)).color(Color32::GREEN).small());
                     } else {
                         ui.label(RichText::new(format!("⚠ v{}", ver)).color(Color32::YELLOW).small());
-                        if ui.small_button("Update").clicked() {
-                            let _ = open::that("https://github.com/JoshuaCHolmes/ev-prototype/releases/latest");
+                        if ui.small_button("⚡ Flash").clicked() {
+                            self.flash_firmware = true;
                         }
                     }
                 } else {
                     ui.label(RichText::new("? old firmware").color(Color32::YELLOW).small());
-                    if ui.small_button("Update").clicked() {
-                        let _ = open::that("https://github.com/JoshuaCHolmes/ev-prototype/releases/latest");
+                    if ui.small_button("⚡ Flash").clicked() {
+                        self.flash_firmware = true;
                     }
                 }
             } else {
@@ -1822,6 +1933,16 @@ impl eframe::App for EVControlApp {
             self.state.active_camera = cam_idx;
             self.camera.start(self.logs.clone(), cam_idx);
             self.reconnect_all = false;
+        }
+        
+        if self.flash_firmware {
+            self.log("Starting firmware flash...");
+            let success = {
+                let mut logs_vec = self.logs.lock().unwrap();
+                self.serial.flash_firmware(&mut logs_vec)
+            };
+            self.state.connected = success;
+            self.flash_firmware = false;
         }
         
         if self.switch_camera {
