@@ -5,9 +5,9 @@
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    execute,
-    style::{Color, ResetColor, SetForegroundColor},
-    terminal::{self, ClearType},
+    execute, queue,
+    style::Print,
+    terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use serde::Serialize;
 use serialport::SerialPort;
@@ -167,7 +167,8 @@ impl Controller {
     fn draw_ui(&self) -> std::io::Result<()> {
         let mut stdout = stdout();
         
-        execute!(stdout, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        // Use queue! instead of execute! for buffered writes, then move cursor to top
+        queue!(stdout, cursor::MoveTo(0, 0))?;
 
         let status = if self.connected { "CONNECTED" } else { "DISCONNECTED" };
         let direction = if self.throttle > 0.0 {
@@ -194,50 +195,53 @@ impl Controller {
         let d = if self.is_key_held('d') { "[D]" } else { " D " };
         let space = if self.is_key_held(' ') { "[SPACE]" } else { " SPACE " };
 
-        // Header
-        execute!(stdout, SetForegroundColor(Color::Cyan))?;
-        println!("================================================================");
-        println!("           EV PROTOTYPE CONTROL CENTER (Rust)");
-        println!("================================================================");
-        execute!(stdout, ResetColor)?;
-        println!();
-
-        // Status
-        println!("  ESP32: {} [{}]", self.port_name, status);
-        println!();
-
-        // Vehicle state
-        println!("  Throttle: {} {:5.1}% {}", tbar, self.throttle.abs(), direction);
-        println!("  Steering: {} {:+6.1} {}", sbar, self.steering, steer_dir);
+        // Build entire frame as a string, then write once
+        let brake_line = if self.brake { "            >> BRAKE <<" } else { "                       " };
         
-        if self.brake {
-            execute!(stdout, SetForegroundColor(Color::Red))?;
-            println!("            >> BRAKE <<");
-            execute!(stdout, ResetColor)?;
-        } else {
-            println!();
-        }
-        println!();
+        let frame = format!(
+r#"================================================================
+           EV PROTOTYPE CONTROL CENTER (Rust)
+              Texas A&M FLiNT - Team Autopilot
+================================================================
 
-        // Key status
-        execute!(stdout, SetForegroundColor(Color::Yellow))?;
-        println!("  Keys:        {}", w);
-        println!("            {} {} {}", a, s, d);
-        println!("            {} = E-STOP", space);
-        execute!(stdout, ResetColor)?;
-        println!();
+  ESP32: {} [{}]
 
-        println!("----------------------------------------------------------------");
-        println!("  W=Accel  S=Brake/Rev  A/D=Steer  SPACE=E-Stop  Q=Quit");
-        println!("----------------------------------------------------------------");
+  Throttle: {} {:5.1}% {}
+  Steering: {} {:+6.1} {}
+{}
 
+  Keys:        {}
+            {} {} {}
+            {} = E-STOP
+
+----------------------------------------------------------------
+  W=Accel  S=Brake/Rev  A/D=Steer  SPACE=E-Stop  Q=Quit
+----------------------------------------------------------------
+"#,
+            self.port_name, status,
+            tbar, self.throttle.abs(), direction,
+            sbar, self.steering, steer_dir,
+            brake_line,
+            w,
+            a, s, d,
+            space
+        );
+
+        // Write entire frame at once
+        queue!(stdout, Print(frame))?;
         stdout.flush()?;
         Ok(())
     }
 
     fn run(&mut self) -> std::io::Result<()> {
+        let mut stdout = stdout();
+        
         terminal::enable_raw_mode()?;
-        execute!(stdout(), cursor::Hide)?;
+        // Enter alternate screen buffer to prevent flicker and preserve original content
+        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+
+        // Initial clear
+        execute!(stdout, terminal::Clear(ClearType::All))?;
 
         println!("\n[*] Connecting to ESP32 on {}...", self.port_name);
         if !self.connect() {
@@ -248,6 +252,7 @@ impl Controller {
 
         println!("[*] Starting in 2 seconds...");
         println!("[*] Hold W/A/S/D to drive, SPACE for e-brake, Q to quit");
+        stdout.flush()?;
         std::thread::sleep(Duration::from_secs(2));
 
         let mut last_send = Instant::now();
@@ -282,8 +287,8 @@ impl Controller {
                 last_send = Instant::now();
             }
 
-            // Update UI at 10Hz
-            if last_draw.elapsed() > Duration::from_millis(100) {
+            // Update UI at 15Hz (faster for smoother display)
+            if last_draw.elapsed() > Duration::from_millis(66) {
                 self.draw_ui()?;
                 last_draw = Instant::now();
             }
@@ -294,10 +299,11 @@ impl Controller {
         self.brake = true;
         self.send_command();
 
-        execute!(stdout(), cursor::Show)?;
+        // Leave alternate screen and restore terminal
+        execute!(stdout, LeaveAlternateScreen, cursor::Show)?;
         terminal::disable_raw_mode()?;
 
-        println!("\n\n[+] Controller stopped. Vehicle safed.");
+        println!("\n[+] Controller stopped. Vehicle safed.");
         Ok(())
     }
 }
