@@ -1225,8 +1225,9 @@ impl EVControlApp {
                 ui.label("To:");
                 let response = ui.text_edit_singleline(&mut self.nav.search_query);
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    // Perform search
-                    self.nav.search_results = self.nav.geocode_search(&self.nav.search_query);
+                    // Perform search - clone query to avoid borrow conflict
+                    let query = self.nav.search_query.clone();
+                    self.nav.search_results = self.nav.geocode_search(&query);
                     if !self.nav.search_results.is_empty() {
                         self.log(&format!("Found {} results", self.nav.search_results.len()));
                     } else {
@@ -1234,7 +1235,8 @@ impl EVControlApp {
                     }
                 }
                 if ui.button("Search").clicked() {
-                    self.nav.search_results = self.nav.geocode_search(&self.nav.search_query);
+                    let query = self.nav.search_query.clone();
+                    self.nav.search_results = self.nav.geocode_search(&query);
                 }
             });
             
