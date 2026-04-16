@@ -1,6 +1,6 @@
 [package]
 name = "ev-control-gui"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 description = "EV Prototype Control Center - Windows GUI"
 authors = ["Texas A&M FLiNT - Team Autopilot"]
@@ -17,15 +17,9 @@ reqwest = { version = "0.12", features = ["blocking"] }
 directories = "5.0"
 chrono = "0.4"
 
+# Camera support - escapi is Windows-only, simple DirectShow wrapper
 [target.'cfg(windows)'.dependencies]
-nokhwa = { version = "0.10", features = ["input-msmf", "output-threaded"], optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-nokhwa = { version = "0.10", features = ["input-v4l", "output-threaded"], optional = true }
-
-[features]
-default = []
-camera = ["nokhwa"]
+escapi = "4.0"
 
 [profile.release]
 opt-level = 3

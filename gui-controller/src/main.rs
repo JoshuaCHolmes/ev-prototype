@@ -3,7 +3,8 @@
 //!
 //! Full-featured GUI with camera feed, real map display, and vehicle controls.
 
-#![windows_subsystem = "windows"]  // Hide console window on Windows
+// Hide console window on Windows - must use both approaches for reliability
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
 use egui::{Color32, RichText, Vec2, Rect, Pos2, Stroke, FontId};
@@ -60,20 +61,11 @@ impl Default for VehicleState {
     }
 }
 
+#[derive(Clone)]
 struct CameraFrame {
     data: Vec<u8>,
     width: u32,
     height: u32,
-}
-
-impl Clone for CameraFrame {
-    fn clone(&self) -> Self {
-        Self {
-            data: self.data.clone(),
-            width: self.width,
-            height: self.height,
-        }
-    }
 }
 
 // ============================================================================
@@ -215,7 +207,6 @@ impl SerialController {
                         let name = info.product.as_deref().unwrap_or("Unknown");
                         logs.push(format!("[{}] Port: {} ({})", timestamp(), port.port_name, name));
                         
-                        // CP2102 or CH340
                         if (info.vid == 0x10C4 && info.pid == 0xEA60) || info.vid == 0x1A86 {
                             self.port_name = port.port_name.clone();
                             logs.push(format!("[{}] Found ESP32 on {}", timestamp(), self.port_name));
@@ -268,7 +259,7 @@ impl SerialController {
 }
 
 // ============================================================================
-// Camera Handler (using OpenCV via system call for Windows compatibility)
+// Camera Handler using escapi (Windows DirectShow)
 // ============================================================================
 
 struct CameraHandler {
@@ -286,6 +277,7 @@ impl CameraHandler {
         }
     }
 
+    #[cfg(windows)]
     fn start(&self, logs: Arc<Mutex<Vec<String>>>) {
         let frame = self.frame.clone();
         let running = self.running.clone();
@@ -293,52 +285,69 @@ impl CameraHandler {
         *running.lock().unwrap() = true;
 
         std::thread::spawn(move || {
-            // Try to use OpenCV if available, otherwise use platform-specific capture
-            #[cfg(windows)]
-            {
-                use std::process::Command;
-                
-                // Check if we can find cameras via WMI or DirectShow
-                if let Ok(output) = Command::new("powershell")
-                    .args(["-Command", "Get-PnpDevice -Class Camera | Select-Object -ExpandProperty FriendlyName"])
-                    .output()
-                {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let count = stdout.lines().filter(|l| !l.is_empty()).count();
-                    *camera_count.lock().unwrap() = count;
-                    
-                    if let Ok(mut logs) = logs.lock() {
-                        logs.push(format!("[{}] Found {} camera(s)", timestamp(), count));
-                        for (i, name) in stdout.lines().filter(|l| !l.is_empty()).enumerate() {
-                            logs.push(format!("[{}]   Camera {}: {}", timestamp(), i, name.trim()));
-                        }
-                    }
-                }
-                
-                // For actual capture, we'd need opencv or nokhwa with proper features
-                // For now, indicate cameras found but capture not available without opencv
-                if let Ok(mut logs) = logs.lock() {
-                    logs.push(format!("[{}] Camera capture requires OpenCV (build with --features camera)", timestamp()));
-                }
+            // Initialize escapi
+            let device_count = escapi::init();
+            *camera_count.lock().unwrap() = device_count as usize;
+            
+            if let Ok(mut l) = logs.lock() {
+                l.push(format!("[{}] ESCAPI initialized: {} camera(s)", timestamp(), device_count));
             }
             
-            #[cfg(not(windows))]
-            {
-                // Linux: try v4l2
-                use std::fs;
-                if let Ok(entries) = fs::read_dir("/dev") {
-                    let videos: Vec<_> = entries
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.file_name().to_string_lossy().starts_with("video"))
-                        .collect();
-                    *camera_count.lock().unwrap() = videos.len();
+            if device_count == 0 {
+                if let Ok(mut l) = logs.lock() {
+                    l.push(format!("[{}] No cameras available", timestamp()));
+                }
+                return;
+            }
+            
+            // Try to open first camera
+            let width = 320;
+            let height = 240;
+            
+            match escapi::Device::new(0, width, height) {
+                Ok(mut camera) => {
+                    if let Ok(mut l) = logs.lock() {
+                        let name = escapi::device_name(0).unwrap_or_else(|| "Unknown".to_string());
+                        l.push(format!("[{}] Opened camera: {}", timestamp(), name));
+                    }
                     
-                    if let Ok(mut logs) = logs.lock() {
-                        logs.push(format!("[{}] Found {} video device(s)", timestamp(), videos.len()));
+                    while *running.lock().unwrap() {
+                        if let Ok(pixels) = camera.capture() {
+                            // escapi returns BGRA, convert to RGB
+                            let mut rgb_data = Vec::with_capacity((width * height * 3) as usize);
+                            for chunk in pixels.chunks(4) {
+                                if chunk.len() >= 3 {
+                                    rgb_data.push(chunk[2]); // R
+                                    rgb_data.push(chunk[1]); // G
+                                    rgb_data.push(chunk[0]); // B
+                                }
+                            }
+                            
+                            if let Ok(mut f) = frame.lock() {
+                                *f = Some(CameraFrame {
+                                    data: rgb_data,
+                                    width,
+                                    height,
+                                });
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(33));
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut l) = logs.lock() {
+                        l.push(format!("[{}] Failed to open camera: {:?}", timestamp(), e));
                     }
                 }
             }
         });
+    }
+
+    #[cfg(not(windows))]
+    fn start(&self, logs: Arc<Mutex<Vec<String>>>) {
+        if let Ok(mut l) = logs.lock() {
+            l.push(format!("[{}] Camera support is Windows-only in this build", timestamp()));
+        }
     }
 
     fn stop(&self) {
@@ -384,7 +393,7 @@ impl EVControlApp {
         {
             let mut l = logs.lock().unwrap();
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
-            l.push(format!("[{}] EV Prototype Control Center v1.1", timestamp()));
+            l.push(format!("[{}] EV Prototype Control Center v1.2", timestamp()));
             l.push(format!("[{}] Texas A&M FLiNT - Team Autopilot", timestamp()));
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
         }
@@ -472,20 +481,21 @@ impl EVControlApp {
             self.state.throttle = 0.0;
         }
 
-        // Speed estimate and simulation
+        // Speed estimate and simulation - MUCH SLOWER movement
         self.state.speed_estimate = self.state.throttle.abs() * 0.3;
         
         if self.state.sim_mode && self.state.throttle.abs() > 0.0 && !self.state.brake {
-            let speed_deg = self.state.speed_estimate as f64 * 0.000006;
+            // Reduced speed: 0.0000005 instead of 0.000006 (12x slower)
+            let speed_deg = self.state.speed_estimate as f64 * 0.0000005;
             self.state.lat += speed_deg * (self.state.heading as f64).to_radians().cos();
             self.state.lon += speed_deg * (self.state.heading as f64).to_radians().sin();
-            self.state.heading = (self.state.heading + self.state.steering * 0.04) % 360.0;
+            // Slower turning too
+            self.state.heading = (self.state.heading + self.state.steering * 0.01) % 360.0;
             if self.state.heading < 0.0 {
                 self.state.heading += 360.0;
             }
         }
         
-        // Update camera count
         self.state.camera_count = self.camera.get_camera_count();
     }
 
@@ -508,7 +518,7 @@ impl EVControlApp {
                 if count > 0 {
                     ui.label(RichText::new(format!("{} found", count)).color(Color32::GREEN).small());
                 } else {
-                    ui.label(RichText::new("None found").color(Color32::RED).small());
+                    ui.label(RichText::new("None").color(Color32::RED).small());
                 }
             });
         });
@@ -519,42 +529,47 @@ impl EVControlApp {
         let rect = response.rect;
 
         if let Some(frame) = self.camera.get_frame() {
+            // ASCII-style rendering with color
             let chars = [' ', '░', '▒', '▓', '█'];
-            let char_w = 8.0;
-            let char_h = 12.0;
+            let char_w = 6.0;
+            let char_h = 10.0;
             let cols = (rect.width() / char_w) as usize;
             let rows = (rect.height() / char_h) as usize;
 
             for row in 0..rows {
                 for col in 0..cols {
-                    let src_x = (col * frame.width as usize / cols) as u32;
-                    let src_y = (row * frame.height as usize / rows) as u32;
-                    let idx = ((src_y * frame.width + src_x) * 3) as usize;
+                    let src_x = col * frame.width as usize / cols.max(1);
+                    let src_y = row * frame.height as usize / rows.max(1);
+                    let idx = (src_y * frame.width as usize + src_x) * 3;
                     
                     if idx + 2 < frame.data.len() {
-                        let r = frame.data[idx] as u32;
-                        let g = frame.data[idx + 1] as u32;
-                        let b = frame.data[idx + 2] as u32;
-                        let brightness = (r + g + b) / 3;
-                        let char_idx = (brightness * chars.len() as u32 / 256) as usize;
-                        let char_idx = char_idx.min(chars.len() - 1);
+                        let r = frame.data[idx];
+                        let g = frame.data[idx + 1];
+                        let b = frame.data[idx + 2];
+                        let brightness = ((r as u32 + g as u32 + b as u32) / 3) as usize;
+                        let char_idx = (brightness * chars.len() / 256).min(chars.len() - 1);
                         
                         painter.text(
                             Pos2::new(rect.min.x + col as f32 * char_w, rect.min.y + row as f32 * char_h),
                             egui::Align2::LEFT_TOP,
                             chars[char_idx],
-                            FontId::monospace(12.0),
-                            Color32::from_rgb(r as u8, g as u8, b as u8),
+                            FontId::monospace(10.0),
+                            Color32::from_rgb(r, g, b),
                         );
                     }
                 }
             }
         } else {
             painter.rect_filled(rect, 4.0, Color32::from_gray(30));
+            let msg = if self.state.camera_count > 0 {
+                format!("{} camera(s) detected\nInitializing...", self.state.camera_count)
+            } else {
+                "No Camera Feed\n\nConnect USB camera".to_string()
+            };
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("No Camera Feed\n\n{} camera(s) detected\nCapture requires OpenCV build", self.state.camera_count),
+                msg,
                 FontId::proportional(14.0),
                 Color32::GRAY,
             );
@@ -573,7 +588,6 @@ impl EVControlApp {
         let available = ui.available_size();
         let map_size = available;
 
-        // Update map texture periodically
         if self.last_map_update.elapsed() > Duration::from_millis(500) || self.map_texture.is_none() {
             if let Some(map_img) = self.map_cache.render_map(
                 self.state.lat,
@@ -602,7 +616,7 @@ impl EVControlApp {
             painter.rect_filled(rect, 4.0, Color32::from_gray(60));
         }
 
-        // Draw vehicle marker at center
+        // Vehicle marker
         let center = rect.center();
         let heading_rad = (self.state.heading - 90.0).to_radians();
         let arrow_len = 15.0;
@@ -638,18 +652,18 @@ impl EVControlApp {
             let sim_color = if self.state.sim_mode { Color32::from_rgb(200, 100, 255) } else { Color32::GREEN };
             if ui.add(egui::Button::new(RichText::new(sim_text).color(sim_color))).clicked() {
                 self.state.sim_mode = !self.state.sim_mode;
-                self.log(if self.state.sim_mode { "Switched to SIM mode" } else { "Switched to GPS mode" });
+                self.log(if self.state.sim_mode { "SIM mode (map moves)" } else { "GPS mode (static)" });
             }
             
             let auto_text = if self.state.auto_mode { "🤖 AUTO" } else { "👤 MANUAL" };
             let auto_color = if self.state.auto_mode { Color32::from_rgb(0, 200, 255) } else { Color32::YELLOW };
             if ui.add(egui::Button::new(RichText::new(auto_text).color(auto_color))).clicked() {
                 self.state.auto_mode = !self.state.auto_mode;
-                self.log(if self.state.auto_mode { "AUTO mode enabled" } else { "MANUAL mode" });
+                self.log(if self.state.auto_mode { "AUTO mode" } else { "MANUAL mode" });
             }
         });
         
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
         // Key indicators
         ui.horizontal(|ui| {
@@ -663,12 +677,11 @@ impl EVControlApp {
         });
 
         ui.horizontal(|ui| {
-            let keys = [
+            for (key, label, color) in [
                 (egui::Key::A, "A", Color32::DARK_GREEN),
                 (egui::Key::S, "S", Color32::DARK_RED),
                 (egui::Key::D, "D", Color32::DARK_GREEN),
-            ];
-            for (key, label, color) in keys {
+            ] {
                 let btn = if self.is_key_held(key) {
                     egui::Button::new(RichText::new(format!("[{}]", label)).strong()).fill(color)
                 } else {
@@ -683,7 +696,7 @@ impl EVControlApp {
             }
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
         // Gauges
         ui.horizontal(|ui| {
@@ -710,16 +723,14 @@ impl EVControlApp {
             };
             ui.label(RichText::new(format!("{:.1} mph", self.state.speed_estimate)).color(color).strong());
             
-            // Heading
             let cardinals = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
             let idx = ((self.state.heading + 22.5) / 45.0) as usize % 8;
             ui.label(RichText::new(format!("  {} ({:.0}°)", cardinals[idx], self.state.heading)).weak());
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
         ui.separator();
         
-        // Action buttons
         ui.horizontal(|ui| {
             if ui.add(egui::Button::new(RichText::new("🛑 E-STOP").color(Color32::WHITE)).fill(Color32::DARK_RED)).clicked() {
                 self.estop_pressed = true;
@@ -733,22 +744,21 @@ impl EVControlApp {
             }
         });
 
-        ui.add_space(5.0);
-        ui.label(RichText::new("W/S=Throttle  A/D=Steer  Space=E-Stop  Esc=Stop  R=Reset").small().weak());
+        ui.add_space(4.0);
+        ui.label(RichText::new("W/S=Throttle A/D=Steer Space=Stop M=Mode").small().weak());
     }
 
     fn draw_logs_panel(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("📊 Logs");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Status indicators
                 if self.state.connected {
                     ui.label(RichText::new("● ESP32").color(Color32::GREEN).small());
                 } else {
                     ui.label(RichText::new("○ ESP32").color(Color32::RED).small());
                 }
-                ui.label(RichText::new(format!("● {}cam", self.state.camera_count))
-                    .color(if self.state.camera_count > 0 { Color32::GREEN } else { Color32::RED }).small());
+                let cam_color = if self.state.camera_count > 0 { Color32::GREEN } else { Color32::RED };
+                ui.label(RichText::new(format!("● {}cam", self.state.camera_count)).color(cam_color).small());
             });
         });
         ui.separator();
@@ -767,7 +777,6 @@ impl EVControlApp {
 
 impl eframe::App for EVControlApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Handle keyboard input
         ctx.input(|i| {
             let now = Instant::now();
             for key in [egui::Key::W, egui::Key::A, egui::Key::S, egui::Key::D, egui::Key::Space] {
@@ -800,7 +809,6 @@ impl eframe::App for EVControlApp {
             }
         });
         
-        // Handle button presses
         if self.estop_pressed {
             self.state.throttle = 0.0;
             self.state.steering = 0.0;
@@ -816,11 +824,10 @@ impl eframe::App for EVControlApp {
                 camera_count: self.state.camera_count,
                 ..Default::default()
             };
-            self.log("Reset to defaults");
+            self.log("Reset");
             self.reset_pressed = false;
         }
 
-        // Update vehicle
         if !self.state.auto_mode {
             self.update_controls();
         }
@@ -831,66 +838,56 @@ impl eframe::App for EVControlApp {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("🚗 EV Prototype Control Center").strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("Texas A&M FLiNT - Team Autopilot").weak());
+                    ui.label(RichText::new("Texas A&M FLiNT").weak());
                     ui.separator();
                     let mode = if self.state.sim_mode { "SIM" } else { "GPS" };
-                    let mode_color = if self.state.sim_mode { Color32::from_rgb(200, 100, 255) } else { Color32::GREEN };
-                    ui.label(RichText::new(mode).color(mode_color));
+                    let color = if self.state.sim_mode { Color32::from_rgb(200, 100, 255) } else { Color32::GREEN };
+                    ui.label(RichText::new(mode).color(color));
                 });
             });
         });
 
-        // Fixed 2x2 grid layout
+        // 2x2 grid
         egui::CentralPanel::default().show(ctx, |ui| {
             let available = ui.available_size();
             let half_w = available.x / 2.0 - 5.0;
             let half_h = available.y / 2.0 - 5.0;
             
             ui.horizontal(|ui| {
-                // Top row
                 ui.vertical(|ui| {
                     ui.set_width(half_w);
                     ui.set_height(half_h);
-                    egui::Frame::dark_canvas(ui.style())
-                        .inner_margin(8.0)
-                        .show(ui, |ui| {
-                            self.draw_camera_panel(ui);
-                        });
+                    egui::Frame::dark_canvas(ui.style()).inner_margin(8.0).show(ui, |ui| {
+                        self.draw_camera_panel(ui);
+                    });
                 });
                 
                 ui.vertical(|ui| {
                     ui.set_width(half_w);
                     ui.set_height(half_h);
-                    egui::Frame::dark_canvas(ui.style())
-                        .inner_margin(8.0)
-                        .show(ui, |ui| {
-                            self.draw_map_panel(ui, ctx);
-                        });
+                    egui::Frame::dark_canvas(ui.style()).inner_margin(8.0).show(ui, |ui| {
+                        self.draw_map_panel(ui, ctx);
+                    });
                 });
             });
             
             ui.add_space(5.0);
             
             ui.horizontal(|ui| {
-                // Bottom row
                 ui.vertical(|ui| {
                     ui.set_width(half_w);
                     ui.set_height(half_h);
-                    egui::Frame::dark_canvas(ui.style())
-                        .inner_margin(8.0)
-                        .show(ui, |ui| {
-                            self.draw_controls_panel(ui);
-                        });
+                    egui::Frame::dark_canvas(ui.style()).inner_margin(8.0).show(ui, |ui| {
+                        self.draw_controls_panel(ui);
+                    });
                 });
                 
                 ui.vertical(|ui| {
                     ui.set_width(half_w);
                     ui.set_height(half_h);
-                    egui::Frame::dark_canvas(ui.style())
-                        .inner_margin(8.0)
-                        .show(ui, |ui| {
-                            self.draw_logs_panel(ui);
-                        });
+                    egui::Frame::dark_canvas(ui.style()).inner_margin(8.0).show(ui, |ui| {
+                        self.draw_logs_panel(ui);
+                    });
                 });
             });
         });
@@ -905,7 +902,7 @@ impl eframe::App for EVControlApp {
 }
 
 // ============================================================================
-// Main
+// Main - Windows entry point to hide console
 // ============================================================================
 
 fn main() -> eframe::Result<()> {
