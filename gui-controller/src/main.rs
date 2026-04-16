@@ -1,7 +1,7 @@
 //! EV Prototype Control Center - Windows GUI
 //! Texas A&M FLiNT - Team Autopilot
 //!
-//! Full-featured GUI with camera feed, real map display, and vehicle controls.
+//! Full-featured GUI with camera feed, real map display, vehicle controls, and FSD.
 
 // Hide console window on Windows - must use both approaches for reliability
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -28,6 +28,34 @@ struct Command {
     b: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum CameraPosition {
+    Front,
+    Back,
+    Left,
+    Right,
+}
+
+impl CameraPosition {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Front => "Front",
+            Self::Back => "Back",
+            Self::Left => "Left",
+            Self::Right => "Right",
+        }
+    }
+    
+    fn arrow(&self) -> &'static str {
+        match self {
+            Self::Front => "▲",
+            Self::Back => "▼",
+            Self::Left => "◀",
+            Self::Right => "▶",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct VehicleState {
     throttle: f32,
@@ -42,6 +70,14 @@ struct VehicleState {
     sim_mode: bool,
     camera_count: usize,
     active_camera: usize,
+    // Real GPS position (saved when entering SIM mode)
+    real_lat: f64,
+    real_lon: f64,
+    // Camera assignments for FSD
+    camera_assignments: HashMap<CameraPosition, usize>,
+    // Navigation target
+    nav_target: Option<(f64, f64)>,
+    nav_active: bool,
 }
 
 impl Default for VehicleState {
@@ -59,6 +95,11 @@ impl Default for VehicleState {
             sim_mode: true,
             camera_count: 0,
             active_camera: 0,
+            real_lat: 30.6187,
+            real_lon: -96.3365,
+            camera_assignments: HashMap::new(),
+            nav_target: None,
+            nav_active: false,
         }
     }
 }
@@ -155,10 +196,15 @@ impl MapTileCache {
 
         let half_w = (width / 2) as i32;
         let half_h = (height / 2) as i32;
+        
+        // Calculate how many tiles we need in each direction
+        // Add extra buffer to prevent edge loading issues
+        let tiles_x = ((width as i32 / 256) / 2 + 2) as i32;
+        let tiles_y = ((height as i32 / 256) / 2 + 2) as i32;
 
-        // Render 3x3 grid of tiles centered on current position
-        for dy in -1i32..=1 {
-            for dx in -1i32..=1 {
+        // Render grid of tiles centered on current position
+        for dy in -tiles_y..=tiles_y {
+            for dx in -tiles_x..=tiles_x {
                 let ttx = (tile_ix as i32 + dx) as u32;
                 let tty = (tile_iy as i32 + dy) as u32;
                 
@@ -178,11 +224,12 @@ impl MapTileCache {
             }
         }
         
-        // Pre-fetch outer ring of tiles (5x5 minus inner 3x3) in background
-        for dy in -2i32..=2 {
-            for dx in -2i32..=2 {
-                if dy.abs() <= 1 && dx.abs() <= 1 {
-                    continue; // Skip already-fetched inner 3x3
+        // Pre-fetch additional outer ring for smooth scrolling
+        let prefetch_range = tiles_x.max(tiles_y) + 1;
+        for dy in -prefetch_range..=prefetch_range {
+            for dx in -prefetch_range..=prefetch_range {
+                if dx.abs() <= tiles_x && dy.abs() <= tiles_y {
+                    continue; // Skip already-fetched tiles
                 }
                 let ttx = (tile_ix as i32 + dx) as u32;
                 let tty = (tile_iy as i32 + dy) as u32;
@@ -412,6 +459,7 @@ struct EVControlApp {
     reset_pressed: bool,
     reconnect_all: bool,
     switch_camera: bool,
+    toggle_sim: bool,
 }
 
 impl EVControlApp {
@@ -421,7 +469,7 @@ impl EVControlApp {
         {
             let mut l = logs.lock().unwrap();
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
-            l.push(format!("[{}] EV Prototype Control Center v1.3", timestamp()));
+            l.push(format!("[{}] EV Prototype Control Center v1.4", timestamp()));
             l.push(format!("[{}] Texas A&M FLiNT - Team Autopilot", timestamp()));
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
         }
@@ -453,6 +501,7 @@ impl EVControlApp {
             reset_pressed: false,
             reconnect_all: false,
             switch_camera: false,
+            toggle_sim: false,
         }
     }
 
@@ -511,22 +560,39 @@ impl EVControlApp {
             self.state.throttle = 0.0;
         }
 
-        // Speed estimate and simulation - MUCH SLOWER movement
+        // Speed estimate and simulation - VERY SLOW movement for realistic map scale
         self.state.speed_estimate = self.state.throttle.abs() * 0.3;
         
         if self.state.sim_mode && self.state.throttle.abs() > 0.0 && !self.state.brake {
-            // Reduced speed: 0.0000005 instead of 0.000006 (12x slower)
-            let speed_deg = self.state.speed_estimate as f64 * 0.0000005;
+            // Much slower: ~1 meter per frame at full throttle (zoom 17 = ~1.2m/pixel)
+            // 0.00000001 degrees ≈ 1mm, so 0.00000005 ≈ 5mm per frame
+            let speed_deg = self.state.speed_estimate as f64 * 0.00000005;
             self.state.lat += speed_deg * (self.state.heading as f64).to_radians().cos();
             self.state.lon += speed_deg * (self.state.heading as f64).to_radians().sin();
-            // Slower turning too
-            self.state.heading = (self.state.heading + self.state.steering * 0.01) % 360.0;
+            // Slower turning
+            self.state.heading = (self.state.heading + self.state.steering * 0.005) % 360.0;
             if self.state.heading < 0.0 {
                 self.state.heading += 360.0;
             }
         }
         
         self.state.camera_count = self.camera.get_camera_count();
+    }
+    
+    fn toggle_sim_mode(&mut self) {
+        if self.state.sim_mode {
+            // Leaving SIM mode - snap back to real position
+            self.state.lat = self.state.real_lat;
+            self.state.lon = self.state.real_lon;
+            self.state.sim_mode = false;
+            self.log("GPS mode - snapped to real position");
+        } else {
+            // Entering SIM mode - save current real position
+            self.state.real_lat = self.state.lat;
+            self.state.real_lon = self.state.lon;
+            self.state.sim_mode = true;
+            self.log("SIM mode - position can move freely");
+        }
     }
 
     fn send_command(&mut self) {
@@ -681,8 +747,7 @@ impl EVControlApp {
             let sim_text = if self.state.sim_mode { "🎮 SIM" } else { "📍 GPS" };
             let sim_color = if self.state.sim_mode { Color32::from_rgb(200, 100, 255) } else { Color32::GREEN };
             if ui.add(egui::Button::new(RichText::new(sim_text).color(sim_color))).clicked() {
-                self.state.sim_mode = !self.state.sim_mode;
-                self.log(if self.state.sim_mode { "SIM mode (map moves)" } else { "GPS mode (static)" });
+                self.toggle_sim = true;
             }
             
             let auto_text = if self.state.auto_mode { "🤖 AUTO" } else { "👤 MANUAL" };
@@ -761,6 +826,13 @@ impl EVControlApp {
         ui.add_space(8.0);
         ui.separator();
         
+        // Vehicle diagram with camera assignments
+        ui.collapsing("🚗 Vehicle Cameras", |ui| {
+            self.draw_vehicle_diagram(ui);
+        });
+        
+        ui.separator();
+        
         ui.horizontal(|ui| {
             if ui.add(egui::Button::new(RichText::new("🛑 E-STOP").color(Color32::WHITE)).fill(Color32::DARK_RED)).clicked() {
                 self.estop_pressed = true;
@@ -775,7 +847,7 @@ impl EVControlApp {
         
         ui.horizontal(|ui| {
             let cam_count = self.state.camera_count;
-            if cam_count > 1 {
+            if cam_count > 0 {
                 if ui.button(format!("📷 Cam {} →", self.state.active_camera)).clicked() {
                     self.switch_camera = true;
                 }
@@ -785,6 +857,78 @@ impl EVControlApp {
 
         ui.add_space(4.0);
         ui.label(RichText::new("W/S=Throttle A/D=Steer Space=Stop M=Mode").small().weak());
+    }
+    
+    fn draw_vehicle_diagram(&mut self, ui: &mut egui::Ui) {
+        let cam_count = self.state.camera_count;
+        
+        // Draw a simple top-down vehicle view
+        let size = Vec2::new(120.0, 80.0);
+        let (response, painter) = ui.allocate_painter(size, egui::Sense::hover());
+        let rect = response.rect;
+        let center = rect.center();
+        
+        // Vehicle body
+        let body_rect = Rect::from_center_size(center, Vec2::new(40.0, 60.0));
+        painter.rect_filled(body_rect, 4.0, Color32::from_rgb(60, 60, 80));
+        painter.rect_stroke(body_rect, 4.0, Stroke::new(1.0, Color32::WHITE));
+        
+        // Direction indicator (front)
+        painter.line_segment(
+            [Pos2::new(center.x, body_rect.min.y), Pos2::new(center.x, body_rect.min.y - 8.0)],
+            Stroke::new(2.0, Color32::GREEN),
+        );
+        
+        // Camera position indicators
+        let positions = [
+            (CameraPosition::Front, Pos2::new(center.x, rect.min.y + 10.0)),
+            (CameraPosition::Back, Pos2::new(center.x, rect.max.y - 10.0)),
+            (CameraPosition::Left, Pos2::new(rect.min.x + 15.0, center.y)),
+            (CameraPosition::Right, Pos2::new(rect.max.x - 15.0, center.y)),
+        ];
+        
+        for (pos, point) in &positions {
+            let assigned = self.state.camera_assignments.get(pos);
+            let color = if assigned.is_some() { Color32::GREEN } else { Color32::GRAY };
+            painter.circle_filled(*point, 6.0, color);
+            painter.text(
+                *point,
+                egui::Align2::CENTER_CENTER,
+                pos.arrow(),
+                FontId::proportional(8.0),
+                Color32::WHITE,
+            );
+        }
+        
+        // Camera assignment buttons
+        if cam_count > 0 {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Assign:").small());
+                for pos in [CameraPosition::Front, CameraPosition::Back, CameraPosition::Left, CameraPosition::Right] {
+                    let current = self.state.camera_assignments.get(&pos).copied();
+                    let label = match current {
+                        Some(idx) => format!("{}{}", pos.arrow(), idx),
+                        None => format!("{}?", pos.arrow()),
+                    };
+                    let color = if current.is_some() { Color32::GREEN } else { Color32::GRAY };
+                    if ui.add(egui::Button::new(RichText::new(&label).small().color(color)).small()).clicked() {
+                        // Cycle through cameras or unassign
+                        let next = match current {
+                            None => Some(0),
+                            Some(idx) if idx + 1 < cam_count => Some(idx + 1),
+                            Some(_) => None,
+                        };
+                        if let Some(idx) = next {
+                            self.state.camera_assignments.insert(pos, idx);
+                            self.log(&format!("Assigned camera {} to {}", idx, pos.label()));
+                        } else {
+                            self.state.camera_assignments.remove(&pos);
+                            self.log(&format!("Unassigned {} camera", pos.label()));
+                        }
+                    }
+                }
+            });
+        }
     }
 
     fn draw_logs_panel(&self, ui: &mut egui::Ui) {
@@ -838,8 +982,7 @@ impl eframe::App for EVControlApp {
             }
             
             if i.key_pressed(egui::Key::M) {
-                self.state.sim_mode = !self.state.sim_mode;
-                self.log(if self.state.sim_mode { "SIM mode" } else { "GPS mode" });
+                self.toggle_sim = true;
             }
             
             if i.key_pressed(egui::Key::P) {
@@ -847,6 +990,12 @@ impl eframe::App for EVControlApp {
                 self.log(if self.state.auto_mode { "AUTO mode" } else { "MANUAL mode" });
             }
         });
+        
+        // Handle sim mode toggle (with position snap)
+        if self.toggle_sim {
+            self.toggle_sim_mode();
+            self.toggle_sim = false;
+        }
         
         if self.estop_pressed {
             self.state.throttle = 0.0;
@@ -858,10 +1007,14 @@ impl eframe::App for EVControlApp {
         }
         
         if self.reset_pressed {
+            let old_assignments = self.state.camera_assignments.clone();
             self.state = VehicleState {
                 connected: self.state.connected,
                 camera_count: self.state.camera_count,
                 active_camera: self.state.active_camera,
+                real_lat: self.state.real_lat,
+                real_lon: self.state.real_lon,
+                camera_assignments: old_assignments,
                 ..Default::default()
             };
             self.log("Reset");
@@ -874,15 +1027,27 @@ impl eframe::App for EVControlApp {
                 let mut logs_vec = self.logs.lock().unwrap();
                 self.state.connected = self.serial.find_and_connect(&mut logs_vec);
             }
-            self.camera.start(self.logs.clone(), self.state.active_camera);
+            // Re-count cameras before starting
+            self.state.camera_count = self.camera.get_camera_count();
+            let cam_idx = self.state.active_camera.min(self.state.camera_count.saturating_sub(1));
+            self.state.active_camera = cam_idx;
+            self.camera.start(self.logs.clone(), cam_idx);
             self.reconnect_all = false;
         }
         
         if self.switch_camera {
-            let next = (self.state.active_camera + 1) % self.state.camera_count.max(1);
-            self.state.active_camera = next;
-            self.log(&format!("Switching to camera {}", next));
-            self.camera.start(self.logs.clone(), next);
+            // Get fresh camera count from handler
+            let count = self.camera.get_camera_count();
+            self.state.camera_count = count;
+            
+            if count > 0 {
+                let next = (self.state.active_camera + 1) % count;
+                self.state.active_camera = next;
+                self.log(&format!("Switching to camera {}", next));
+                self.camera.start(self.logs.clone(), next);
+            } else {
+                self.log("No cameras available to switch");
+            }
             self.switch_camera = false;
         }
 
