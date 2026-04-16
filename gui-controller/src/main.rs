@@ -515,8 +515,8 @@ impl NavigationSystem {
             let (wp_lat, wp_lon) = route.waypoints[route.current_index];
             let dist = haversine_distance(current_lat, current_lon, wp_lat, wp_lon);
             
-            // If within 5 meters, advance to next waypoint
-            if dist < 0.005 { // ~5m in km
+            // If within 15 meters, advance to next waypoint (more forgiving)
+            if dist < 0.015 { // ~15m in km
                 route.current_index += 1;
                 if route.current_index >= route.waypoints.len() {
                     return true; // Arrived!
@@ -691,7 +691,7 @@ struct SerialController {
 }
 
 // Expected firmware version - update when ESP32 code changes
-const EXPECTED_FIRMWARE_VERSION: &str = "1.5.7";
+const EXPECTED_FIRMWARE_VERSION: &str = "1.5.8";
 
 impl SerialController {
     fn new() -> Self {
@@ -1066,7 +1066,7 @@ impl EVControlApp {
         {
             let mut l = logs.lock().unwrap();
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
-            l.push(format!("[{}] EV Prototype Control Center v1.5.7", timestamp()));
+            l.push(format!("[{}] EV Prototype Control Center v1.5.8", timestamp()));
             l.push(format!("[{}] Texas A&M FLiNT - Team Autopilot", timestamp()));
             l.push(format!("[{}] Microtransport FSD - Sidewalk Priority", timestamp()));
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
@@ -1161,23 +1161,33 @@ impl EVControlApp {
             self.state.throttle = 0.0;
         }
 
-        // Speed estimate and simulation - VERY SLOW movement for realistic map scale
+        // Speed estimate
         self.state.speed_estimate = self.state.throttle.abs() * 0.3;
         
-        if self.state.sim_mode && self.state.throttle.abs() > 0.0 && !self.state.brake {
-            // Much slower: ~1 meter per frame at full throttle (zoom 17 = ~1.2m/pixel)
-            // 0.00000001 degrees ≈ 1mm, so 0.00000005 ≈ 5mm per frame
-            let speed_deg = self.state.speed_estimate as f64 * 0.00000005;
-            self.state.lat += speed_deg * (self.state.heading as f64).to_radians().cos();
-            self.state.lon += speed_deg * (self.state.heading as f64).to_radians().sin();
-            // Slower turning
-            self.state.heading = (self.state.heading + self.state.steering * 0.005) % 360.0;
-            if self.state.heading < 0.0 {
-                self.state.heading += 360.0;
-            }
+        // Only update position in manual mode (FSD handles its own position updates)
+        if self.state.sim_mode && !self.state.auto_mode && self.state.throttle.abs() > 0.0 && !self.state.brake {
+            self.update_sim_position();
         }
         
         self.state.camera_count = self.camera.get_camera_count();
+    }
+    
+    fn update_sim_position(&mut self) {
+        // ~0.000005 degrees/frame at full throttle ≈ ~0.5m/frame at 60fps ≈ 30m/s max
+        let speed_deg = (self.state.throttle.abs() / 100.0) as f64 * 0.000005;
+        
+        // Move in heading direction (heading 0 = North = +lat, 90 = East = +lon)
+        let heading_rad = (self.state.heading as f64).to_radians();
+        self.state.lat += speed_deg * heading_rad.cos();
+        // Adjust longitude for latitude (degrees get smaller near poles)
+        self.state.lon += speed_deg * heading_rad.sin() / self.state.lat.to_radians().cos().abs().max(0.1);
+        
+        // Turn rate: at full steering (100), turn ~0.5 degrees per frame = 30°/sec at 60fps
+        let turn_rate = self.state.steering * 0.005;
+        self.state.heading = (self.state.heading + turn_rate) % 360.0;
+        if self.state.heading < 0.0 {
+            self.state.heading += 360.0;
+        }
     }
     
     fn toggle_sim_mode(&mut self) {
@@ -1225,19 +1235,25 @@ impl EVControlApp {
             self.state.lon, 
             self.state.heading
         ) {
-            // Smooth steering adjustment
-            let steering_diff = target_steering - self.state.steering;
-            self.state.steering += steering_diff.clamp(-5.0, 5.0);
+            // Proportional steering - don't overshoot
+            // If we need to turn 45°, steer at 100%. Less angle = less steering.
+            let steering_needed = target_steering.clamp(-100.0, 100.0);
+            
+            // Gradually adjust steering (prevents jerky movement)
+            let max_steer_change = 3.0; // Max 3% change per frame
+            let steering_diff = steering_needed - self.state.steering;
+            self.state.steering += steering_diff.clamp(-max_steer_change, max_steer_change);
             self.state.steering = self.state.steering.clamp(-100.0, 100.0);
             
-            // Speed based on steering angle (slow down for turns)
-            let turn_factor = 1.0 - (self.state.steering.abs() / 150.0);
-            let target_speed = 50.0 * turn_factor; // Max 50% throttle in auto mode
+            // Speed based on how much we need to turn (slow down for sharp turns)
+            let turn_severity = (self.state.steering.abs() / 100.0); // 0.0 to 1.0
+            let target_speed = 40.0 * (1.0 - turn_severity * 0.7); // 40% max, down to 12% for sharp turns
             
+            // Gradually adjust throttle
             if self.state.throttle < target_speed {
-                self.state.throttle = (self.state.throttle + 2.0).min(target_speed);
+                self.state.throttle = (self.state.throttle + 1.5).min(target_speed);
             } else {
-                self.state.throttle = (self.state.throttle - 1.0).max(target_speed);
+                self.state.throttle = (self.state.throttle - 0.5).max(target_speed);
             }
             
             self.state.brake = false;
@@ -1261,21 +1277,7 @@ impl EVControlApp {
         
         // Update position in SIM mode
         if self.state.sim_mode && self.state.throttle > 0.0 && !self.state.brake {
-            // Speed: ~0.00001 degrees/frame at full throttle ≈ ~1m/frame at 60fps ≈ 60m/s max
-            // Adjusted for reasonable demo speeds
-            let speed_deg = (self.state.throttle / 100.0) as f64 * 0.00002;
-            
-            // Move in heading direction (heading 0 = North = +lat, 90 = East = +lon)
-            let heading_rad = (self.state.heading as f64).to_radians();
-            self.state.lat += speed_deg * heading_rad.cos();
-            self.state.lon += speed_deg * heading_rad.sin() / self.state.lat.to_radians().cos().max(0.01);
-            
-            // Turn rate: at full steering (100), turn ~2 degrees per frame
-            let turn_rate = self.state.steering * 0.02;
-            self.state.heading = (self.state.heading + turn_rate) % 360.0;
-            if self.state.heading < 0.0 {
-                self.state.heading += 360.0;
-            }
+            self.update_sim_position();
         }
         
         self.state.speed_estimate = self.state.throttle.abs() * 0.3;
