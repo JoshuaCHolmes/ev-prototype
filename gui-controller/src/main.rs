@@ -112,6 +112,430 @@ struct CameraFrame {
 }
 
 // ============================================================================
+// FSD Navigation System - Prioritizes sidewalks and bike lanes
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum PathType {
+    Sidewalk,      // Best - primary path type
+    Cycleway,      // Great - bike lanes
+    SharedPath,    // Good - mixed use paths
+    Crossing,      // OK - road crossings
+    Road,          // Penalty - only when necessary
+}
+
+impl PathType {
+    fn cost_multiplier(&self) -> f64 {
+        match self {
+            Self::Sidewalk => 1.0,    // Preferred
+            Self::Cycleway => 1.1,    // Slightly less preferred
+            Self::SharedPath => 1.2,  // Still good
+            Self::Crossing => 2.0,    // Acceptable for crossing
+            Self::Road => 5.0,        // Heavy penalty
+        }
+    }
+    
+    fn color(&self) -> Color32 {
+        match self {
+            Self::Sidewalk => Color32::from_rgb(100, 200, 100),   // Green
+            Self::Cycleway => Color32::from_rgb(100, 150, 255),   // Blue
+            Self::SharedPath => Color32::from_rgb(200, 200, 100), // Yellow
+            Self::Crossing => Color32::from_rgb(255, 150, 50),    // Orange
+            Self::Road => Color32::from_rgb(200, 80, 80),         // Red
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NavNode {
+    id: u64,
+    lat: f64,
+    lon: f64,
+}
+
+#[derive(Clone, Debug)]
+struct NavEdge {
+    from: u64,
+    to: u64,
+    path_type: PathType,
+    distance: f64,
+}
+
+#[derive(Clone, Debug)]
+struct NavRoute {
+    waypoints: Vec<(f64, f64)>,
+    path_types: Vec<PathType>,
+    total_distance: f64,
+    current_index: usize,
+}
+
+struct NavigationSystem {
+    nodes: HashMap<u64, NavNode>,
+    edges: Vec<NavEdge>,
+    adjacency: HashMap<u64, Vec<usize>>, // node_id -> edge indices
+    route: Option<NavRoute>,
+    destination_name: String,
+    search_query: String,
+    search_results: Vec<(String, f64, f64)>, // name, lat, lon
+    last_fetch: Option<Instant>,
+    fetch_radius: f64, // in degrees
+    fetch_center: Option<(f64, f64)>,
+}
+
+impl NavigationSystem {
+    fn new() -> Self {
+        Self {
+            nodes: HashMap::new(),
+            edges: Vec::new(),
+            adjacency: HashMap::new(),
+            route: None,
+            destination_name: String::new(),
+            search_query: String::new(),
+            search_results: Vec::new(),
+            last_fetch: None,
+            fetch_radius: 0.01, // ~1km
+            fetch_center: None,
+        }
+    }
+    
+    fn geocode_search(&mut self, query: &str) -> Vec<(String, f64, f64)> {
+        // Use Nominatim for geocoding (free OSM geocoding service)
+        let encoded = query.replace(' ', "+");
+        let url = format!(
+            "https://nominatim.openstreetmap.org/search?q={}&format=json&limit=5",
+            encoded
+        );
+        
+        let client = reqwest::blocking::Client::new();
+        if let Ok(response) = client
+            .get(&url)
+            .header("User-Agent", "EV-Prototype-FSD/1.5")
+            .timeout(Duration::from_secs(5))
+            .send()
+        {
+            if let Ok(json) = response.json::<serde_json::Value>() {
+                if let Some(results) = json.as_array() {
+                    return results.iter().filter_map(|r| {
+                        let name = r["display_name"].as_str()?.to_string();
+                        let lat = r["lat"].as_str()?.parse().ok()?;
+                        let lon = r["lon"].as_str()?.parse().ok()?;
+                        Some((name, lat, lon))
+                    }).collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+    
+    fn fetch_paths_around(&mut self, lat: f64, lon: f64) {
+        // Check if we need to refetch
+        if let Some(center) = self.fetch_center {
+            let dist = ((lat - center.0).powi(2) + (lon - center.1).powi(2)).sqrt();
+            if dist < self.fetch_radius * 0.5 {
+                return; // Still within cached area
+            }
+        }
+        
+        // Rate limit
+        if let Some(last) = self.last_fetch {
+            if last.elapsed() < Duration::from_secs(10) {
+                return;
+            }
+        }
+        
+        // Overpass query for sidewalks, bike lanes, paths, and crossings
+        let bbox = format!("{},{},{},{}", 
+            lat - self.fetch_radius, 
+            lon - self.fetch_radius,
+            lat + self.fetch_radius,
+            lon + self.fetch_radius
+        );
+        
+        let query = format!(r#"
+            [out:json][timeout:25];
+            (
+              way["highway"="footway"]({bbox});
+              way["highway"="sidewalk"]({bbox});
+              way["highway"="cycleway"]({bbox});
+              way["highway"="path"]({bbox});
+              way["highway"="pedestrian"]({bbox});
+              way["highway"="crossing"]({bbox});
+              way["footway"="crossing"]({bbox});
+              way["sidewalk"]["sidewalk"!="no"]({bbox});
+              way["highway"="residential"]({bbox});
+              way["highway"="tertiary"]({bbox});
+            );
+            out body;
+            >;
+            out skel qt;
+        "#, bbox = bbox);
+        
+        let url = "https://overpass-api.de/api/interpreter";
+        let client = reqwest::blocking::Client::new();
+        
+        if let Ok(response) = client
+            .post(url)
+            .header("User-Agent", "EV-Prototype-FSD/1.5")
+            .timeout(Duration::from_secs(30))
+            .body(query)
+            .send()
+        {
+            if let Ok(json) = response.json::<serde_json::Value>() {
+                self.parse_overpass_response(&json);
+                self.fetch_center = Some((lat, lon));
+                self.last_fetch = Some(Instant::now());
+            }
+        }
+    }
+    
+    fn parse_overpass_response(&mut self, json: &serde_json::Value) {
+        self.nodes.clear();
+        self.edges.clear();
+        self.adjacency.clear();
+        
+        if let Some(elements) = json["elements"].as_array() {
+            // First pass: collect all nodes
+            for elem in elements {
+                if elem["type"].as_str() == Some("node") {
+                    if let (Some(id), Some(lat), Some(lon)) = (
+                        elem["id"].as_u64(),
+                        elem["lat"].as_f64(),
+                        elem["lon"].as_f64(),
+                    ) {
+                        self.nodes.insert(id, NavNode { id, lat, lon });
+                    }
+                }
+            }
+            
+            // Second pass: create edges from ways
+            for elem in elements {
+                if elem["type"].as_str() == Some("way") {
+                    let tags = &elem["tags"];
+                    let path_type = self.classify_way(tags);
+                    
+                    if let Some(nodes) = elem["nodes"].as_array() {
+                        let node_ids: Vec<u64> = nodes.iter()
+                            .filter_map(|n| n.as_u64())
+                            .collect();
+                        
+                        for window in node_ids.windows(2) {
+                            if let [from, to] = window {
+                                if let (Some(n1), Some(n2)) = (self.nodes.get(from), self.nodes.get(to)) {
+                                    let distance = haversine_distance(n1.lat, n1.lon, n2.lat, n2.lon);
+                                    let edge_idx = self.edges.len();
+                                    
+                                    self.edges.push(NavEdge {
+                                        from: *from,
+                                        to: *to,
+                                        path_type,
+                                        distance,
+                                    });
+                                    
+                                    self.adjacency.entry(*from).or_default().push(edge_idx);
+                                    
+                                    // Add reverse edge (paths are bidirectional)
+                                    let rev_idx = self.edges.len();
+                                    self.edges.push(NavEdge {
+                                        from: *to,
+                                        to: *from,
+                                        path_type,
+                                        distance,
+                                    });
+                                    self.adjacency.entry(*to).or_default().push(rev_idx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn classify_way(&self, tags: &serde_json::Value) -> PathType {
+        let highway = tags["highway"].as_str().unwrap_or("");
+        let footway = tags["footway"].as_str().unwrap_or("");
+        let sidewalk = tags["sidewalk"].as_str().unwrap_or("");
+        
+        // Priority order for microtransport
+        if highway == "footway" || highway == "sidewalk" || highway == "pedestrian" {
+            if footway == "crossing" {
+                PathType::Crossing
+            } else {
+                PathType::Sidewalk
+            }
+        } else if highway == "cycleway" {
+            PathType::Cycleway
+        } else if highway == "path" {
+            PathType::SharedPath
+        } else if highway == "crossing" || footway == "crossing" {
+            PathType::Crossing
+        } else if sidewalk == "both" || sidewalk == "left" || sidewalk == "right" {
+            PathType::Sidewalk // Road with sidewalk - use sidewalk
+        } else {
+            PathType::Road // Fallback to road
+        }
+    }
+    
+    fn find_nearest_node(&self, lat: f64, lon: f64) -> Option<u64> {
+        self.nodes.values()
+            .min_by(|a, b| {
+                let da = (a.lat - lat).powi(2) + (a.lon - lon).powi(2);
+                let db = (b.lat - lat).powi(2) + (b.lon - lon).powi(2);
+                da.partial_cmp(&db).unwrap()
+            })
+            .map(|n| n.id)
+    }
+    
+    fn calculate_route(&mut self, from_lat: f64, from_lon: f64, to_lat: f64, to_lon: f64) -> bool {
+        // Ensure we have path data
+        self.fetch_paths_around((from_lat + to_lat) / 2.0, (from_lon + to_lon) / 2.0);
+        
+        let start = match self.find_nearest_node(from_lat, from_lon) {
+            Some(id) => id,
+            None => return false,
+        };
+        
+        let goal = match self.find_nearest_node(to_lat, to_lon) {
+            Some(id) => id,
+            None => return false,
+        };
+        
+        // A* pathfinding with path type cost weighting
+        let result = pathfinding::directed::astar::astar(
+            &start,
+            |&node| {
+                self.adjacency.get(&node)
+                    .map(|edges| {
+                        edges.iter().map(|&idx| {
+                            let edge = &self.edges[idx];
+                            let cost = (edge.distance * edge.path_type.cost_multiplier() * 1000.0) as u32;
+                            (edge.to, cost)
+                        }).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            },
+            |&node| {
+                self.nodes.get(&node)
+                    .map(|n| (haversine_distance(n.lat, n.lon, to_lat, to_lon) * 1000.0) as u32)
+                    .unwrap_or(0)
+            },
+            |&node| node == goal,
+        );
+        
+        if let Some((path, _cost)) = result {
+            let mut waypoints = Vec::new();
+            let mut path_types = Vec::new();
+            let mut total_distance = 0.0;
+            
+            for window in path.windows(2) {
+                if let [from, to] = window {
+                    if let Some(node) = self.nodes.get(from) {
+                        waypoints.push((node.lat, node.lon));
+                    }
+                    
+                    // Find edge type
+                    if let Some(edges) = self.adjacency.get(from) {
+                        for &idx in edges {
+                            let edge = &self.edges[idx];
+                            if edge.to == *to {
+                                path_types.push(edge.path_type);
+                                total_distance += edge.distance;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Add final waypoint
+            if let Some(&last) = path.last() {
+                if let Some(node) = self.nodes.get(&last) {
+                    waypoints.push((node.lat, node.lon));
+                }
+            }
+            
+            self.route = Some(NavRoute {
+                waypoints,
+                path_types,
+                total_distance,
+                current_index: 0,
+            });
+            
+            true
+        } else {
+            false
+        }
+    }
+    
+    fn get_steering_to_next_waypoint(&self, current_lat: f64, current_lon: f64, current_heading: f32) -> Option<f32> {
+        let route = self.route.as_ref()?;
+        
+        if route.current_index >= route.waypoints.len() {
+            return None; // Arrived
+        }
+        
+        let (target_lat, target_lon) = route.waypoints[route.current_index];
+        
+        // Calculate bearing to target
+        let target_bearing = calculate_bearing(current_lat, current_lon, target_lat, target_lon);
+        
+        // Calculate steering needed
+        let mut angle_diff = target_bearing - current_heading;
+        
+        // Normalize to -180 to 180
+        while angle_diff > 180.0 { angle_diff -= 360.0; }
+        while angle_diff < -180.0 { angle_diff += 360.0; }
+        
+        // Convert to steering value (-100 to 100)
+        let steering = (angle_diff / 45.0 * 100.0).clamp(-100.0, 100.0);
+        
+        Some(steering)
+    }
+    
+    fn update_progress(&mut self, current_lat: f64, current_lon: f64) -> bool {
+        if let Some(ref mut route) = self.route {
+            if route.current_index >= route.waypoints.len() {
+                return true; // Already arrived
+            }
+            
+            let (wp_lat, wp_lon) = route.waypoints[route.current_index];
+            let dist = haversine_distance(current_lat, current_lon, wp_lat, wp_lon);
+            
+            // If within 5 meters, advance to next waypoint
+            if dist < 0.005 { // ~5m in km
+                route.current_index += 1;
+                if route.current_index >= route.waypoints.len() {
+                    return true; // Arrived!
+                }
+            }
+        }
+        false
+    }
+}
+
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6371.0; // Earth radius in km
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2) 
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+    r * c
+}
+
+fn calculate_bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f32 {
+    let lat1 = lat1.to_radians();
+    let lat2 = lat2.to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    
+    let x = dlon.cos() * lat2.cos();
+    let y = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+    
+    let bearing = x.atan2(y).to_degrees();
+    ((bearing + 360.0) % 360.0) as f32
+}
+
+// ============================================================================
 // Map Tile Cache
 // ============================================================================
 
@@ -460,6 +884,9 @@ struct EVControlApp {
     reconnect_all: bool,
     switch_camera: bool,
     toggle_sim: bool,
+    // FSD Navigation
+    nav: NavigationSystem,
+    nav_search_open: bool,
 }
 
 impl EVControlApp {
@@ -469,8 +896,9 @@ impl EVControlApp {
         {
             let mut l = logs.lock().unwrap();
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
-            l.push(format!("[{}] EV Prototype Control Center v1.4", timestamp()));
+            l.push(format!("[{}] EV Prototype Control Center v1.5", timestamp()));
             l.push(format!("[{}] Texas A&M FLiNT - Team Autopilot", timestamp()));
+            l.push(format!("[{}] Microtransport FSD - Sidewalk Priority", timestamp()));
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
         }
         
@@ -502,6 +930,8 @@ impl EVControlApp {
             reconnect_all: false,
             switch_camera: false,
             toggle_sim: false,
+            nav: NavigationSystem::new(),
+            nav_search_open: false,
         }
     }
 
@@ -594,6 +1024,111 @@ impl EVControlApp {
             self.log("SIM mode - position can move freely");
         }
     }
+    
+    fn update_fsd(&mut self) {
+        // FSD only active when auto_mode is on and we have an active route
+        if !self.state.auto_mode || !self.state.nav_active {
+            return;
+        }
+        
+        // Check if we've arrived
+        if self.nav.update_progress(self.state.lat, self.state.lon) {
+            self.state.throttle = 0.0;
+            self.state.steering = 0.0;
+            self.state.brake = true;
+            self.state.auto_mode = false;
+            self.state.nav_active = false;
+            self.log("🎉 Arrived at destination!");
+            return;
+        }
+        
+        // Get steering direction to next waypoint
+        if let Some(target_steering) = self.nav.get_steering_to_next_waypoint(
+            self.state.lat, 
+            self.state.lon, 
+            self.state.heading
+        ) {
+            // Smooth steering adjustment
+            let steering_diff = target_steering - self.state.steering;
+            self.state.steering += steering_diff.clamp(-5.0, 5.0);
+            self.state.steering = self.state.steering.clamp(-100.0, 100.0);
+            
+            // Speed based on steering angle (slow down for turns)
+            let turn_factor = 1.0 - (self.state.steering.abs() / 150.0);
+            let target_speed = 50.0 * turn_factor; // Max 50% throttle in auto mode
+            
+            if self.state.throttle < target_speed {
+                self.state.throttle = (self.state.throttle + 2.0).min(target_speed);
+            } else {
+                self.state.throttle = (self.state.throttle - 1.0).max(target_speed);
+            }
+            
+            self.state.brake = false;
+            
+            // In GPS mode with cameras, we would add obstacle detection here
+            if !self.state.sim_mode {
+                // TODO: Check camera feeds for obstacles
+                // For now, just use basic navigation
+                self.check_camera_obstacles();
+            }
+        }
+        
+        // Update position in SIM mode
+        if self.state.sim_mode && self.state.throttle > 0.0 && !self.state.brake {
+            let speed_deg = (self.state.throttle * 0.3) as f64 * 0.00000005;
+            self.state.lat += speed_deg * (self.state.heading as f64).to_radians().cos();
+            self.state.lon += speed_deg * (self.state.heading as f64).to_radians().sin();
+            self.state.heading = (self.state.heading + self.state.steering * 0.005) % 360.0;
+            if self.state.heading < 0.0 {
+                self.state.heading += 360.0;
+            }
+        }
+        
+        self.state.speed_estimate = self.state.throttle.abs() * 0.3;
+    }
+    
+    fn check_camera_obstacles(&mut self) {
+        // Basic obstacle detection using camera brightness analysis
+        // In a real implementation, this would use ML/CV for object detection
+        
+        if let Some(ref frame) = self.camera.get_frame() {
+            // Check front camera if assigned
+            if let Some(&front_idx) = self.state.camera_assignments.get(&CameraPosition::Front) {
+                if front_idx == self.state.active_camera {
+                    // Simple brightness check in center of frame (crude obstacle detection)
+                    let center_y = frame.height / 2;
+                    let center_x = frame.width / 2;
+                    let sample_size = 20;
+                    
+                    let mut dark_pixels = 0;
+                    for dy in 0..sample_size {
+                        for dx in 0..sample_size {
+                            let x = (center_x as i32 - sample_size as i32 / 2 + dx as i32) as u32;
+                            let y = (center_y as i32 + dy as i32) as u32; // Look ahead/down
+                            if x < frame.width && y < frame.height {
+                                let idx = ((y * frame.width + x) * 3) as usize;
+                                if idx + 2 < frame.data.len() {
+                                    let brightness = (frame.data[idx] as u32 + 
+                                                     frame.data[idx + 1] as u32 + 
+                                                     frame.data[idx + 2] as u32) / 3;
+                                    if brightness < 50 {
+                                        dark_pixels += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // If too many dark pixels (potential obstacle), slow down
+                    let dark_ratio = dark_pixels as f32 / (sample_size * sample_size) as f32;
+                    if dark_ratio > 0.5 {
+                        self.state.throttle *= 0.5;
+                        // self.log("Obstacle detected - slowing");
+                    }
+                }
+            }
+        }
+    }
 
     fn send_command(&mut self) {
         if self.last_send.elapsed() > Duration::from_millis(50) {
@@ -673,12 +1208,77 @@ impl EVControlApp {
     }
 
     fn draw_map_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Header with search toggle
         ui.horizontal(|ui| {
             ui.heading("🗺️ Map");
+            if ui.button("🔍 Navigate").clicked() {
+                self.nav_search_open = !self.nav_search_open;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(format!("{:.5}°, {:.5}°", self.state.lat, self.state.lon)).small().weak());
             });
         });
+        
+        // Navigation search bar
+        if self.nav_search_open {
+            ui.horizontal(|ui| {
+                ui.label("To:");
+                let response = ui.text_edit_singleline(&mut self.nav.search_query);
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    // Perform search
+                    self.nav.search_results = self.nav.geocode_search(&self.nav.search_query);
+                    if !self.nav.search_results.is_empty() {
+                        self.log(&format!("Found {} results", self.nav.search_results.len()));
+                    } else {
+                        self.log("No results found");
+                    }
+                }
+                if ui.button("Search").clicked() {
+                    self.nav.search_results = self.nav.geocode_search(&self.nav.search_query);
+                }
+            });
+            
+            // Show search results
+            if !self.nav.search_results.is_empty() {
+                ui.group(|ui| {
+                    for (name, lat, lon) in self.nav.search_results.clone() {
+                        let short_name: String = name.chars().take(40).collect();
+                        if ui.button(&short_name).clicked() {
+                            self.state.nav_target = Some((lat, lon));
+                            self.nav.destination_name = name.clone();
+                            self.nav.search_results.clear();
+                            self.nav_search_open = false;
+                            
+                            // Calculate route
+                            if self.nav.calculate_route(self.state.lat, self.state.lon, lat, lon) {
+                                self.state.nav_active = true;
+                                if let Some(ref route) = self.nav.route {
+                                    self.log(&format!("Route: {:.1}km via sidewalks/paths", route.total_distance));
+                                }
+                            } else {
+                                self.log("Could not calculate route - try closer destination");
+                            }
+                        }
+                    }
+                });
+            }
+            
+            // Show active navigation info
+            if self.state.nav_active {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("🧭").color(Color32::GREEN));
+                    let dest: String = self.nav.destination_name.chars().take(25).collect();
+                    ui.label(RichText::new(&dest).small());
+                    if ui.small_button("✕ Cancel").clicked() {
+                        self.state.nav_active = false;
+                        self.state.nav_target = None;
+                        self.nav.route = None;
+                        self.log("Navigation cancelled");
+                    }
+                });
+            }
+        }
+        
         ui.separator();
 
         let available = ui.available_size();
@@ -711,8 +1311,51 @@ impl EVControlApp {
         } else {
             painter.rect_filled(rect, 4.0, Color32::from_gray(60));
         }
+        
+        // Draw route if active
+        if let Some(ref route) = self.nav.route {
+            let center = rect.center();
+            let zoom = self.map_cache.zoom as f64;
+            let scale = 256.0 * 2_f64.powi(zoom as i32) / 360.0; // pixels per degree (approximate)
+            
+            // Draw route line segments with path type coloring
+            for i in 0..route.waypoints.len().saturating_sub(1) {
+                let (lat1, lon1) = route.waypoints[i];
+                let (lat2, lon2) = route.waypoints[i + 1];
+                
+                // Convert lat/lon offset from current position to screen pixels
+                let dx1 = ((lon1 - self.state.lon) * scale * (self.state.lat.to_radians().cos())) as f32;
+                let dy1 = ((self.state.lat - lat1) * scale) as f32;
+                let dx2 = ((lon2 - self.state.lon) * scale * (self.state.lat.to_radians().cos())) as f32;
+                let dy2 = ((self.state.lat - lat2) * scale) as f32;
+                
+                let p1 = Pos2::new(center.x + dx1, center.y + dy1);
+                let p2 = Pos2::new(center.x + dx2, center.y + dy2);
+                
+                let color = if i < route.path_types.len() {
+                    route.path_types[i].color()
+                } else {
+                    Color32::YELLOW
+                };
+                
+                // Highlight current segment
+                let width = if i == route.current_index { 4.0 } else { 2.0 };
+                painter.line_segment([p1, p2], Stroke::new(width, color));
+            }
+            
+            // Draw destination marker
+            if let Some((dest_lat, dest_lon)) = self.state.nav_target {
+                let dx = ((dest_lon - self.state.lon) * scale * (self.state.lat.to_radians().cos())) as f32;
+                let dy = ((self.state.lat - dest_lat) * scale) as f32;
+                let dest_pos = Pos2::new(center.x + dx, center.y + dy);
+                
+                painter.circle_filled(dest_pos, 8.0, Color32::from_rgb(255, 100, 100));
+                painter.circle_stroke(dest_pos, 8.0, Stroke::new(2.0, Color32::WHITE));
+                painter.text(dest_pos + Vec2::new(0.0, -15.0), egui::Align2::CENTER_CENTER, "🎯", FontId::proportional(12.0), Color32::WHITE);
+            }
+        }
 
-        // Vehicle marker
+        // Vehicle marker (always on top)
         let center = rect.center();
         let heading_rad = (self.state.heading - 90.0).to_radians();
         let arrow_len = 15.0;
@@ -736,6 +1379,27 @@ impl EVControlApp {
             Stroke::new(2.0, Color32::WHITE),
         ));
         painter.circle_stroke(center, 20.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 128)));
+        
+        // Path type legend if navigating
+        if self.state.nav_active {
+            let legend_y = rect.max.y - 60.0;
+            let legend_x = rect.min.x + 10.0;
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(legend_x - 5.0, legend_y - 5.0), Vec2::new(95.0, 55.0)),
+                4.0,
+                Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+            );
+            for (i, (pt, label)) in [
+                (PathType::Sidewalk, "Sidewalk"),
+                (PathType::Cycleway, "Bike Lane"),
+                (PathType::SharedPath, "Path"),
+                (PathType::Road, "Road"),
+            ].iter().enumerate() {
+                let y = legend_y + i as f32 * 12.0;
+                painter.circle_filled(Pos2::new(legend_x + 5.0, y + 4.0), 4.0, pt.color());
+                painter.text(Pos2::new(legend_x + 15.0, y), egui::Align2::LEFT_TOP, *label, FontId::proportional(10.0), Color32::WHITE);
+            }
+        }
     }
 
     fn draw_controls_panel(&mut self, ui: &mut egui::Ui) {
@@ -1051,7 +1715,10 @@ impl eframe::App for EVControlApp {
             self.switch_camera = false;
         }
 
-        if !self.state.auto_mode {
+        // Update vehicle - either manual or FSD
+        if self.state.auto_mode {
+            self.update_fsd();
+        } else {
             self.update_controls();
         }
         self.send_command();
