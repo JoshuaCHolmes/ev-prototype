@@ -1,0 +1,41 @@
+# Rust
+rust-controller/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# Temp
+*.log
+*.tmp
+
+# Build artifacts
+*.exe
+dist/
+
+# PlatformIO
+esp32/.pio/
+.pio/
+
+# Cargo
+Cargo.lock
+
+# Releases (built artifacts)
+releases/

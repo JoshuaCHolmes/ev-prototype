@@ -1,0 +1,17 @@
+[package]
+name = "ev-control"
+version = "1.0.0"
+edition = "2021"
+description = "EV Prototype Control Center - Standalone Windows/Linux executable"
+authors = ["Texas A&M FLiNT - Team Autopilot"]
+
+[dependencies]
+serialport = "4.3"
+crossterm = "0.27"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

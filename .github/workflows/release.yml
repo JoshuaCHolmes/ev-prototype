@@ -1,0 +1,84 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+      
+      - name: Build Linux
+        run: |
+          cd rust-controller
+          cargo build --release
+          mv target/release/ev-control ../ev-control-linux
+      
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ev-control-linux
+          path: ev-control-linux
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+      
+      - name: Build Windows
+        run: |
+          cd rust-controller
+          cargo build --release
+          move target\release\ev-control.exe ..\ev-control.exe
+      
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ev-control-windows
+          path: ev-control.exe
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            ev-control-linux/ev-control-linux
+            ev-control-windows/ev-control.exe
+            scripts/attach-usb-wsl.bat
+          body: |
+            ## EV Prototype Control Center
+            
+            ### Downloads
+            - `ev-control.exe` - Windows executable
+            - `ev-control-linux` - Linux executable
+            - `attach-usb-wsl.bat` - USB attach script for WSL users
+            
+            ### Usage
+            ```
+            ev-control [COM_PORT]
+            ev-control --list
+            ```
+            
+            Hold W/A/S/D to drive, SPACE for e-brake, Q to quit.
