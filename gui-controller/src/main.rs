@@ -691,7 +691,7 @@ struct SerialController {
 }
 
 // Expected firmware version - update when ESP32 code changes
-const EXPECTED_FIRMWARE_VERSION: &str = "1.5.3";
+const EXPECTED_FIRMWARE_VERSION: &str = "1.5.5";
 
 impl SerialController {
     fn new() -> Self {
@@ -1531,11 +1531,16 @@ impl EVControlApp {
                     if self.serial.firmware_ok() {
                         ui.label(RichText::new(format!("✓ ESP32 v{}", ver)).color(Color32::GREEN).small());
                     } else {
-                        ui.label(RichText::new(format!("⚠ ESP32 v{} (need {})", ver, EXPECTED_FIRMWARE_VERSION))
-                            .color(Color32::YELLOW).small());
+                        ui.label(RichText::new(format!("⚠ v{}", ver)).color(Color32::YELLOW).small());
+                        if ui.small_button("Update").clicked() {
+                            let _ = open::that("https://github.com/JoshuaCHolmes/ev-prototype/releases/latest");
+                        }
                     }
                 } else {
-                    ui.label(RichText::new("? ESP32 (old firmware)").color(Color32::YELLOW).small());
+                    ui.label(RichText::new("? old firmware").color(Color32::YELLOW).small());
+                    if ui.small_button("Update").clicked() {
+                        let _ = open::that("https://github.com/JoshuaCHolmes/ev-prototype/releases/latest");
+                    }
                 }
             } else {
                 ui.label(RichText::new("⊘ ESP32 offline").color(Color32::RED).small());

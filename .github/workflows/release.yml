@@ -100,8 +100,34 @@ jobs:
           name: ev-control-gui-linux
           path: ev-control-gui-linux
 
+  build-esp32-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+      
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.11
+      
+      - name: Compile firmware
+        run: |
+          cd esp32/ev_controller
+          arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir build .
+          # The compiled binary is at build/ev_controller.ino.bin
+          cp build/ev_controller.ino.bin ../../firmware-esp32.bin
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-firmware
+          path: firmware-esp32.bin
+
   release:
-    needs: [build-linux-tui, build-windows-tui, build-windows-gui, build-linux-gui]
+    needs: [build-linux-tui, build-windows-tui, build-windows-gui, build-linux-gui, build-esp32-firmware]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -118,8 +144,9 @@ jobs:
             ev-control-tui-windows/ev-control-tui.exe
             ev-control-gui-windows/ev-control-gui.exe
             ev-control-gui-linux/ev-control-gui-linux
+            esp32-firmware/firmware-esp32.bin
             scripts/attach-usb-wsl.bat
-            scripts/ev-control.bat
+            scripts/flash-esp32.ps1
           body: |
             ## EV Prototype Control Center
             
@@ -128,17 +155,21 @@ jobs:
             - `ev-control-gui-linux` - Linux GUI
             - `ev-control-tui.exe` - Windows TUI (terminal)
             - `ev-control-tui-linux` - Linux TUI (terminal)
+            - `firmware-esp32.bin` - ESP32 firmware binary
+            - `flash-esp32.ps1` - PowerShell script to flash ESP32
             - `attach-usb-wsl.bat` - USB attach script for WSL users
             
-            ### GUI Version
-            Full graphical interface with:
-            - Real OpenStreetMap display
-            - Camera feed (ASCII style)
-            - Vehicle controls and gauges
-            - Status logs
+            ### ESP32 Firmware Update
+            If the GUI shows a firmware version mismatch, update your ESP32:
+            1. Download `firmware-esp32.bin` and `flash-esp32.ps1`
+            2. Run `flash-esp32.ps1` in PowerShell (auto-detects COM port)
+            3. Or manually flash using: `esptool.py --port COMx write_flash 0x10000 firmware-esp32.bin`
             
-            ### TUI Version
-            Terminal-based interface for headless/SSH usage.
+            ### GUI Features
+            - Real OpenStreetMap display with FSD navigation
+            - Camera feed (ASCII style)
+            - Vehicle controls with manual override
+            - Firmware version checking
             
             ### Controls
-            Hold W/A/S/D to drive, SPACE for e-brake, Q to quit.
+            Hold W/A/S/D to drive, SPACE for e-brake, M to toggle mode, Q to quit.
