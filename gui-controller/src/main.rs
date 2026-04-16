@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Sender, Receiver};
 use std::time::{Duration, Instant};
 
 // ============================================================================
@@ -169,6 +170,13 @@ struct NavRoute {
     current_index: usize,
 }
 
+// Messages for async network operations
+enum NavMessage {
+    SearchResults(Vec<(String, f64, f64)>),
+    PathData(serde_json::Value, f64, f64), // json, center_lat, center_lon
+    RoutePending(f64, f64, f64, f64), // from_lat, from_lon, to_lat, to_lon
+}
+
 struct NavigationSystem {
     nodes: HashMap<u64, NavNode>,
     edges: Vec<NavEdge>,
@@ -180,10 +188,17 @@ struct NavigationSystem {
     last_fetch: Option<Instant>,
     fetch_radius: f64, // in degrees
     fetch_center: Option<(f64, f64)>,
+    // Async network handling
+    nav_tx: Sender<NavMessage>,
+    nav_rx: Receiver<NavMessage>,
+    search_pending: bool,
+    paths_pending: bool,
+    route_pending: Option<(f64, f64, f64, f64)>, // from, to coords
 }
 
 impl NavigationSystem {
     fn new() -> Self {
+        let (nav_tx, nav_rx) = channel();
         Self {
             nodes: HashMap::new(),
             edges: Vec::new(),
@@ -195,53 +210,98 @@ impl NavigationSystem {
             last_fetch: None,
             fetch_radius: 0.01, // ~1km
             fetch_center: None,
+            nav_tx,
+            nav_rx,
+            search_pending: false,
+            paths_pending: false,
+            route_pending: None,
         }
     }
     
-    fn geocode_search(&mut self, query: &str, current_lat: f64, current_lon: f64) -> Vec<(String, f64, f64)> {
-        // Use Nominatim for geocoding with location bias
-        let encoded = query.replace(' ', "+");
-        // Use viewbox to bias results toward current location (~50km radius)
-        let bias = 0.5; // degrees, roughly 50km
-        let url = format!(
-            "https://nominatim.openstreetmap.org/search?q={}&format=json&limit=10&viewbox={},{},{},{}&bounded=0",
-            encoded,
-            current_lon - bias, current_lat + bias,
-            current_lon + bias, current_lat - bias
-        );
-        
-        let client = reqwest::blocking::Client::new();
-        if let Ok(response) = client
-            .get(&url)
-            .header("User-Agent", "EV-Prototype-FSD/1.5")
-            .timeout(Duration::from_secs(5))
-            .send()
-        {
-            if let Ok(json) = response.json::<serde_json::Value>() {
-                if let Some(results) = json.as_array() {
-                    let mut parsed: Vec<(String, f64, f64, f64)> = results.iter().filter_map(|r| {
-                        let name = r["display_name"].as_str()?.to_string();
-                        let lat: f64 = r["lat"].as_str()?.parse().ok()?;
-                        let lon: f64 = r["lon"].as_str()?.parse().ok()?;
-                        let dist = haversine_distance(current_lat, current_lon, lat, lon);
-                        Some((name, lat, lon, dist))
-                    }).collect();
+    // Process any completed async operations
+    fn poll_async(&mut self) {
+        while let Ok(msg) = self.nav_rx.try_recv() {
+            match msg {
+                NavMessage::SearchResults(results) => {
+                    self.search_results = results;
+                    self.search_pending = false;
+                }
+                NavMessage::PathData(json, lat, lon) => {
+                    self.parse_overpass_response(&json);
+                    self.fetch_center = Some((lat, lon));
+                    self.last_fetch = Some(Instant::now());
+                    self.paths_pending = false;
                     
-                    // Sort by distance (closest first)
-                    parsed.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
-                    
-                    // Return top 5, without distance field
-                    return parsed.into_iter()
-                        .take(5)
-                        .map(|(name, lat, lon, _)| (name, lat, lon))
-                        .collect();
+                    // If we have a pending route request, calculate it now
+                    if let Some((from_lat, from_lon, to_lat, to_lon)) = self.route_pending.take() {
+                        self.calculate_route_sync(from_lat, from_lon, to_lat, to_lon);
+                    }
+                }
+                NavMessage::RoutePending(from_lat, from_lon, to_lat, to_lon) => {
+                    self.route_pending = Some((from_lat, from_lon, to_lat, to_lon));
                 }
             }
         }
-        Vec::new()
     }
     
-    fn fetch_paths_around(&mut self, lat: f64, lon: f64) {
+    // Start async geocode search
+    fn start_geocode_search(&mut self, query: &str, current_lat: f64, current_lon: f64) {
+        if self.search_pending {
+            return; // Already searching
+        }
+        self.search_pending = true;
+        
+        let tx = self.nav_tx.clone();
+        let query = query.to_string();
+        
+        std::thread::spawn(move || {
+            let encoded = query.replace(' ', "+");
+            let bias = 0.5;
+            let url = format!(
+                "https://nominatim.openstreetmap.org/search?q={}&format=json&limit=10&viewbox={},{},{},{}&bounded=0",
+                encoded,
+                current_lon - bias, current_lat + bias,
+                current_lon + bias, current_lat - bias
+            );
+            
+            let client = reqwest::blocking::Client::new();
+            let results = if let Ok(response) = client
+                .get(&url)
+                .header("User-Agent", "EV-Prototype-FSD/1.5")
+                .timeout(Duration::from_secs(5))
+                .send()
+            {
+                if let Ok(json) = response.json::<serde_json::Value>() {
+                    if let Some(results) = json.as_array() {
+                        let mut parsed: Vec<(String, f64, f64, f64)> = results.iter().filter_map(|r| {
+                            let name = r["display_name"].as_str()?.to_string();
+                            let lat: f64 = r["lat"].as_str()?.parse().ok()?;
+                            let lon: f64 = r["lon"].as_str()?.parse().ok()?;
+                            let dist = haversine_distance_static(current_lat, current_lon, lat, lon);
+                            Some((name, lat, lon, dist))
+                        }).collect();
+                        
+                        parsed.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+                        
+                        parsed.into_iter()
+                            .take(5)
+                            .map(|(name, lat, lon, _)| (name, lat, lon))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            
+            let _ = tx.send(NavMessage::SearchResults(results));
+        });
+    }
+    
+    fn start_fetch_paths(&mut self, lat: f64, lon: f64) {
         // Check if we need to refetch
         if let Some(center) = self.fetch_center {
             let dist = ((lat - center.0).powi(2) + (lon - center.1).powi(2)).sqrt();
@@ -257,48 +317,154 @@ impl NavigationSystem {
             }
         }
         
-        // Overpass query for sidewalks, bike lanes, paths, and crossings
-        let bbox = format!("{},{},{},{}", 
-            lat - self.fetch_radius, 
-            lon - self.fetch_radius,
-            lat + self.fetch_radius,
-            lon + self.fetch_radius
+        if self.paths_pending {
+            return; // Already fetching
+        }
+        self.paths_pending = true;
+        
+        let tx = self.nav_tx.clone();
+        let fetch_radius = self.fetch_radius;
+        
+        std::thread::spawn(move || {
+            let bbox = format!("{},{},{},{}", 
+                lat - fetch_radius, 
+                lon - fetch_radius,
+                lat + fetch_radius,
+                lon + fetch_radius
+            );
+            
+            let query = format!(r#"
+                [out:json][timeout:25];
+                (
+                  way["highway"="footway"]({bbox});
+                  way["highway"="sidewalk"]({bbox});
+                  way["highway"="cycleway"]({bbox});
+                  way["highway"="path"]({bbox});
+                  way["highway"="pedestrian"]({bbox});
+                  way["highway"="crossing"]({bbox});
+                  way["footway"="crossing"]({bbox});
+                  way["sidewalk"]["sidewalk"!="no"]({bbox});
+                  way["highway"="residential"]({bbox});
+                  way["highway"="tertiary"]({bbox});
+                );
+                out body;
+                >;
+                out skel qt;
+            "#, bbox = bbox);
+            
+            let url = "https://overpass-api.de/api/interpreter";
+            let client = reqwest::blocking::Client::new();
+            
+            if let Ok(response) = client
+                .post(url)
+                .header("User-Agent", "EV-Prototype-FSD/1.5")
+                .timeout(Duration::from_secs(30))
+                .body(query)
+                .send()
+            {
+                if let Ok(json) = response.json::<serde_json::Value>() {
+                    let _ = tx.send(NavMessage::PathData(json, lat, lon));
+                }
+            }
+        });
+    }
+    
+    // Calculate route - returns false if path data needs fetching first
+    fn calculate_route(&mut self, from_lat: f64, from_lon: f64, to_lat: f64, to_lon: f64) -> bool {
+        // Check if we have path data for this area
+        let need_fetch = if let Some(center) = self.fetch_center {
+            let dist = ((from_lat - center.0).powi(2) + (from_lon - center.1).powi(2)).sqrt();
+            dist >= self.fetch_radius * 0.5
+        } else {
+            true
+        };
+        
+        if need_fetch || self.nodes.is_empty() {
+            // Need to fetch path data first - queue the route request
+            self.route_pending = Some((from_lat, from_lon, to_lat, to_lon));
+            self.start_fetch_paths((from_lat + to_lat) / 2.0, (from_lon + to_lon) / 2.0);
+            return false; // Route will be calculated when data arrives
+        }
+        
+        self.calculate_route_sync(from_lat, from_lon, to_lat, to_lon)
+    }
+    
+    // Synchronous route calculation (when path data already loaded)
+    fn calculate_route_sync(&mut self, from_lat: f64, from_lon: f64, to_lat: f64, to_lon: f64) -> bool {
+        let start = match self.find_nearest_node(from_lat, from_lon) {
+            Some(id) => id,
+            None => return false,
+        };
+        
+        let goal = match self.find_nearest_node(to_lat, to_lon) {
+            Some(id) => id,
+            None => return false,
+        };
+        
+        // A* pathfinding with path type cost weighting
+        let result = pathfinding::directed::astar::astar(
+            &start,
+            |&node| {
+                self.adjacency.get(&node)
+                    .map(|edges| {
+                        edges.iter().map(|&idx| {
+                            let edge = &self.edges[idx];
+                            let cost = (edge.distance * edge.path_type.cost_multiplier() * 1000.0) as u32;
+                            (edge.to, cost)
+                        }).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            },
+            |&node| {
+                self.nodes.get(&node)
+                    .map(|n| (haversine_distance(n.lat, n.lon, to_lat, to_lon) * 1000.0) as u32)
+                    .unwrap_or(0)
+            },
+            |&node| node == goal,
         );
         
-        let query = format!(r#"
-            [out:json][timeout:25];
-            (
-              way["highway"="footway"]({bbox});
-              way["highway"="sidewalk"]({bbox});
-              way["highway"="cycleway"]({bbox});
-              way["highway"="path"]({bbox});
-              way["highway"="pedestrian"]({bbox});
-              way["highway"="crossing"]({bbox});
-              way["footway"="crossing"]({bbox});
-              way["sidewalk"]["sidewalk"!="no"]({bbox});
-              way["highway"="residential"]({bbox});
-              way["highway"="tertiary"]({bbox});
-            );
-            out body;
-            >;
-            out skel qt;
-        "#, bbox = bbox);
-        
-        let url = "https://overpass-api.de/api/interpreter";
-        let client = reqwest::blocking::Client::new();
-        
-        if let Ok(response) = client
-            .post(url)
-            .header("User-Agent", "EV-Prototype-FSD/1.5")
-            .timeout(Duration::from_secs(30))
-            .body(query)
-            .send()
-        {
-            if let Ok(json) = response.json::<serde_json::Value>() {
-                self.parse_overpass_response(&json);
-                self.fetch_center = Some((lat, lon));
-                self.last_fetch = Some(Instant::now());
+        if let Some((path, _cost)) = result {
+            let mut waypoints = Vec::new();
+            let mut path_types = Vec::new();
+            let mut total_distance = 0.0;
+            
+            for window in path.windows(2) {
+                if let [from, to] = window {
+                    if let Some(node) = self.nodes.get(from) {
+                        waypoints.push((node.lat, node.lon));
+                    }
+                    
+                    // Find edge type
+                    if let Some(edges) = self.adjacency.get(from) {
+                        for &idx in edges {
+                            let edge = &self.edges[idx];
+                            if edge.to == *to {
+                                path_types.push(edge.path_type);
+                                total_distance += edge.distance;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
+            
+            // Add final waypoint
+            if let Some(&last) = path.last() {
+                if let Some(node) = self.nodes.get(&last) {
+                    waypoints.push((node.lat, node.lon));
+                }
+            }
+            
+            self.route = Some(NavRoute {
+                waypoints,
+                path_types,
+                total_distance,
+                current_index: 0,
+            });
+            
+            true
+        } else {
+            false
         }
     }
     
@@ -400,87 +566,6 @@ impl NavigationSystem {
             .map(|n| n.id)
     }
     
-    fn calculate_route(&mut self, from_lat: f64, from_lon: f64, to_lat: f64, to_lon: f64) -> bool {
-        // Ensure we have path data
-        self.fetch_paths_around((from_lat + to_lat) / 2.0, (from_lon + to_lon) / 2.0);
-        
-        let start = match self.find_nearest_node(from_lat, from_lon) {
-            Some(id) => id,
-            None => return false,
-        };
-        
-        let goal = match self.find_nearest_node(to_lat, to_lon) {
-            Some(id) => id,
-            None => return false,
-        };
-        
-        // A* pathfinding with path type cost weighting
-        let result = pathfinding::directed::astar::astar(
-            &start,
-            |&node| {
-                self.adjacency.get(&node)
-                    .map(|edges| {
-                        edges.iter().map(|&idx| {
-                            let edge = &self.edges[idx];
-                            let cost = (edge.distance * edge.path_type.cost_multiplier() * 1000.0) as u32;
-                            (edge.to, cost)
-                        }).collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            },
-            |&node| {
-                self.nodes.get(&node)
-                    .map(|n| (haversine_distance(n.lat, n.lon, to_lat, to_lon) * 1000.0) as u32)
-                    .unwrap_or(0)
-            },
-            |&node| node == goal,
-        );
-        
-        if let Some((path, _cost)) = result {
-            let mut waypoints = Vec::new();
-            let mut path_types = Vec::new();
-            let mut total_distance = 0.0;
-            
-            for window in path.windows(2) {
-                if let [from, to] = window {
-                    if let Some(node) = self.nodes.get(from) {
-                        waypoints.push((node.lat, node.lon));
-                    }
-                    
-                    // Find edge type
-                    if let Some(edges) = self.adjacency.get(from) {
-                        for &idx in edges {
-                            let edge = &self.edges[idx];
-                            if edge.to == *to {
-                                path_types.push(edge.path_type);
-                                total_distance += edge.distance;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Add final waypoint
-            if let Some(&last) = path.last() {
-                if let Some(node) = self.nodes.get(&last) {
-                    waypoints.push((node.lat, node.lon));
-                }
-            }
-            
-            self.route = Some(NavRoute {
-                waypoints,
-                path_types,
-                total_distance,
-                current_index: 0,
-            });
-            
-            true
-        } else {
-            false
-        }
-    }
-    
     fn get_steering_to_next_waypoint(&self, current_lat: f64, current_lon: f64, current_heading: f32) -> Option<f32> {
         let route = self.route.as_ref()?;
         
@@ -535,6 +620,11 @@ fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
         + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().asin();
     r * c
+}
+
+// Static version for use in threads
+fn haversine_distance_static(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    haversine_distance(lat1, lon1, lat2, lon2)
 }
 
 fn calculate_bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f32 {
@@ -1421,20 +1511,20 @@ impl EVControlApp {
                 ui.label("To:");
                 let response = ui.text_edit_singleline(&mut self.nav.search_query);
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    // Perform search - clone query to avoid borrow conflict
+                    // Perform async search
                     let query = self.nav.search_query.clone();
                     let (lat, lon) = (self.state.lat, self.state.lon);
-                    self.nav.search_results = self.nav.geocode_search(&query, lat, lon);
-                    if !self.nav.search_results.is_empty() {
-                        self.log(&format!("Found {} results (nearest first)", self.nav.search_results.len()));
-                    } else {
-                        self.log("No results found");
-                    }
+                    self.nav.start_geocode_search(&query, lat, lon);
+                    self.log("Searching...");
                 }
                 if ui.button("Search").clicked() {
                     let query = self.nav.search_query.clone();
                     let (lat, lon) = (self.state.lat, self.state.lon);
-                    self.nav.search_results = self.nav.geocode_search(&query, lat, lon);
+                    self.nav.start_geocode_search(&query, lat, lon);
+                    self.log("Searching...");
+                }
+                if self.nav.search_pending {
+                    ui.spinner();
                 }
             });
             
@@ -1449,17 +1539,27 @@ impl EVControlApp {
                             self.nav.search_results.clear();
                             self.nav_search_open = false;
                             
-                            // Calculate route
+                            // Calculate route (may be async if path data needed)
                             if self.nav.calculate_route(self.state.lat, self.state.lon, lat, lon) {
                                 self.state.nav_active = true;
                                 if let Some(ref route) = self.nav.route {
                                     self.log(&format!("Route: {:.1}km via sidewalks/paths", route.total_distance));
                                 }
+                            } else if self.nav.paths_pending || self.nav.route_pending.is_some() {
+                                self.log("Loading path data...");
                             } else {
                                 self.log("Could not calculate route - try closer destination");
                             }
                         }
                     }
+                });
+            }
+            
+            // Show pending route status
+            if self.nav.paths_pending || self.nav.route_pending.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading route...");
                 });
             }
             
@@ -1892,6 +1992,17 @@ impl eframe::App for EVControlApp {
                 self.log(if self.state.auto_mode { "AUTO mode" } else { "MANUAL mode" });
             }
         });
+        
+        // Poll async navigation operations
+        self.nav.poll_async();
+        
+        // Check if route became ready after async path loading
+        if self.nav.route.is_some() && self.state.nav_target.is_some() && !self.state.nav_active {
+            self.state.nav_active = true;
+            if let Some(ref route) = self.nav.route {
+                self.log(&format!("Route ready: {:.1}km", route.total_distance));
+            }
+        }
         
         // Handle sim mode toggle (with position snap)
         if self.toggle_sim {
