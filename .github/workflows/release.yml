@@ -108,10 +108,11 @@ jobs:
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
       
-      - name: Install ESP32 core
+      - name: Install ESP32 core and libraries
         run: |
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@2.0.11
+          arduino-cli lib install ArduinoJson@6.21.3
       
       - name: Compile firmware
         run: |

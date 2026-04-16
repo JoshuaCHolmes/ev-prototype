@@ -200,8 +200,15 @@ L298N MODULE PINOUT
               │     │     │   (unused - Motor B)  │
               │     │     │                       │
               ▼     ▼     ▼                       ▼
-            D33   D26   D27                   (leave open or
-          Wire#5 Wire#3 Wire#4                 jumper to ENA)
+            D33   D26   D27                   (leave alone)
+          Wire#5 Wire#3 Wire#4                
+
+
+⚠️ JUMPER CONFIGURATION:
+─────────────────────────
+• ENA jumper → REMOVE (we use PWM from D33 for speed control)
+• ENB jumper → LEAVE IN PLACE (Motor B unused, doesn't matter)
+• 5V jumper  → LEAVE IN PLACE (powers L298N logic from 12V input)
 
 
 SIGNAL TRUTH TABLE:
