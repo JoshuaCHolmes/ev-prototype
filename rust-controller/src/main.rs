@@ -361,6 +361,7 @@ fn main() {
     let port_name = if args.len() > 1 {
         if args[1] == "--list" || args[1] == "-l" {
             list_ports();
+            wait_for_enter();
             return;
         }
         args[1].clone()
@@ -376,6 +377,7 @@ fn main() {
                 list_ports();
                 println!("Usage: ev-control [COM_PORT]");
                 println!("       ev-control --list");
+                wait_for_enter();
                 return;
             }
         }
@@ -384,5 +386,12 @@ fn main() {
     let mut controller = Controller::new(&port_name);
     if let Err(e) = controller.run() {
         eprintln!("Error: {}", e);
+        wait_for_enter();
     }
+}
+
+fn wait_for_enter() {
+    println!("\nPress ENTER to exit...");
+    let mut input = String::new();
+    let _ = std::io::stdin().read_line(&mut input);
 }

@@ -70,6 +70,7 @@ jobs:
             ev-control-linux/ev-control-linux
             ev-control-windows/ev-control.exe
             scripts/attach-usb-wsl.bat
+            scripts/ev-control.bat
           body: |
             ## EV Prototype Control Center
             
