@@ -1,0 +1,33 @@
+[package]
+name = "ev-control-gui"
+version = "1.0.0"
+edition = "2021"
+description = "EV Prototype Control Center - Windows GUI"
+authors = ["Texas A&M FLiNT - Team Autopilot"]
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["image"] }
+image = "0.25"
+serialport = "4.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["blocking"] }
+directories = "5.0"
+chrono = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+nokhwa = { version = "0.10", features = ["input-msmf", "output-threaded"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-v4l", "output-threaded"], optional = true }
+
+[features]
+default = []
+camera = ["nokhwa"]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

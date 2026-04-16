@@ -1,18 +1,18 @@
-# Rust
-rust-controller/target/
-**/*.rs.bk
+# Build artifacts
+target/
+*.exe
+*.pdb
+Cargo.lock
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-.venv/
-venv/
+# ESP32/PlatformIO
+.pio/
+.vscode/
+*.bin
+
+# Releases (built by CI)
+releases/
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -20,22 +20,3 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
-*:Zone.Identifier
-
-# Temp
-*.log
-*.tmp
-
-# Build artifacts
-*.exe
-dist/
-
-# PlatformIO
-esp32/.pio/
-.pio/
-
-# Cargo
-Cargo.lock
-
-# Releases (built artifacts)
-releases/

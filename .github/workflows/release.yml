@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  build-linux:
+  build-linux-tui:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,19 +21,19 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       
-      - name: Build Linux
+      - name: Build Linux TUI
         run: |
           cd rust-controller
           cargo build --release
-          mv target/release/ev-control ../ev-control-linux
+          mv target/release/ev-control ../ev-control-tui-linux
       
-      - name: Upload Linux artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ev-control-linux
-          path: ev-control-linux
+          name: ev-control-tui-linux
+          path: ev-control-tui-linux
 
-  build-windows:
+  build-windows-tui:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,20 +41,67 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       
-      - name: Build Windows
+      - name: Build Windows TUI
         run: |
           cd rust-controller
           cargo build --release
-          move target\release\ev-control.exe ..\ev-control.exe
+          move target\release\ev-control.exe ..\ev-control-tui.exe
       
-      - name: Upload Windows artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ev-control-windows
-          path: ev-control.exe
+          name: ev-control-tui-windows
+          path: ev-control-tui.exe
+
+  build-windows-gui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Build Windows GUI
+        run: |
+          cd gui-controller
+          cargo build --release
+          move target\release\ev-control-gui.exe ..\ev-control-gui.exe
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ev-control-gui-windows
+          path: ev-control-gui.exe
+
+  build-linux-gui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgtk-3-dev libssl-dev
+      
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Build Linux GUI
+        run: |
+          cd gui-controller
+          cargo build --release
+          mv target/release/ev-control-gui ../ev-control-gui-linux
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ev-control-gui-linux
+          path: ev-control-gui-linux
 
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux-tui, build-windows-tui, build-windows-gui, build-linux-gui]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -67,22 +114,31 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            ev-control-linux/ev-control-linux
-            ev-control-windows/ev-control.exe
+            ev-control-tui-linux/ev-control-tui-linux
+            ev-control-tui-windows/ev-control-tui.exe
+            ev-control-gui-windows/ev-control-gui.exe
+            ev-control-gui-linux/ev-control-gui-linux
             scripts/attach-usb-wsl.bat
             scripts/ev-control.bat
           body: |
             ## EV Prototype Control Center
             
             ### Downloads
-            - `ev-control.exe` - Windows executable
-            - `ev-control-linux` - Linux executable
+            - `ev-control-gui.exe` - **Windows GUI** (recommended)
+            - `ev-control-gui-linux` - Linux GUI
+            - `ev-control-tui.exe` - Windows TUI (terminal)
+            - `ev-control-tui-linux` - Linux TUI (terminal)
             - `attach-usb-wsl.bat` - USB attach script for WSL users
             
-            ### Usage
-            ```
-            ev-control [COM_PORT]
-            ev-control --list
-            ```
+            ### GUI Version
+            Full graphical interface with:
+            - Real OpenStreetMap display
+            - Camera feed (ASCII style)
+            - Vehicle controls and gauges
+            - Status logs
             
+            ### TUI Version
+            Terminal-based interface for headless/SSH usage.
+            
+            ### Controls
             Hold W/A/S/D to drive, SPACE for e-brake, Q to quit.
