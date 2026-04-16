@@ -92,7 +92,7 @@ impl Default for VehicleState {
             heading: 0.0,
             auto_mode: false,
             connected: false,
-            sim_mode: true,
+            sim_mode: false, // Default to GPS mode
             camera_count: 0,
             active_camera: 0,
             real_lat: 30.6187,
@@ -198,12 +198,16 @@ impl NavigationSystem {
         }
     }
     
-    fn geocode_search(&mut self, query: &str) -> Vec<(String, f64, f64)> {
-        // Use Nominatim for geocoding (free OSM geocoding service)
+    fn geocode_search(&mut self, query: &str, current_lat: f64, current_lon: f64) -> Vec<(String, f64, f64)> {
+        // Use Nominatim for geocoding with location bias
         let encoded = query.replace(' ', "+");
+        // Use viewbox to bias results toward current location (~50km radius)
+        let bias = 0.5; // degrees, roughly 50km
         let url = format!(
-            "https://nominatim.openstreetmap.org/search?q={}&format=json&limit=5",
-            encoded
+            "https://nominatim.openstreetmap.org/search?q={}&format=json&limit=10&viewbox={},{},{},{}&bounded=0",
+            encoded,
+            current_lon - bias, current_lat + bias,
+            current_lon + bias, current_lat - bias
         );
         
         let client = reqwest::blocking::Client::new();
@@ -215,12 +219,22 @@ impl NavigationSystem {
         {
             if let Ok(json) = response.json::<serde_json::Value>() {
                 if let Some(results) = json.as_array() {
-                    return results.iter().filter_map(|r| {
+                    let mut parsed: Vec<(String, f64, f64, f64)> = results.iter().filter_map(|r| {
                         let name = r["display_name"].as_str()?.to_string();
-                        let lat = r["lat"].as_str()?.parse().ok()?;
-                        let lon = r["lon"].as_str()?.parse().ok()?;
-                        Some((name, lat, lon))
+                        let lat: f64 = r["lat"].as_str()?.parse().ok()?;
+                        let lon: f64 = r["lon"].as_str()?.parse().ok()?;
+                        let dist = haversine_distance(current_lat, current_lon, lat, lon);
+                        Some((name, lat, lon, dist))
                     }).collect();
+                    
+                    // Sort by distance (closest first)
+                    parsed.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+                    
+                    // Return top 5, without distance field
+                    return parsed.into_iter()
+                        .take(5)
+                        .map(|(name, lat, lon, _)| (name, lat, lon))
+                        .collect();
                 }
             }
         }
@@ -896,7 +910,7 @@ impl EVControlApp {
         {
             let mut l = logs.lock().unwrap();
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
-            l.push(format!("[{}] EV Prototype Control Center v1.5", timestamp()));
+            l.push(format!("[{}] EV Prototype Control Center v1.5.2", timestamp()));
             l.push(format!("[{}] Texas A&M FLiNT - Team Autopilot", timestamp()));
             l.push(format!("[{}] Microtransport FSD - Sidewalk Priority", timestamp()));
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
@@ -1026,8 +1040,14 @@ impl EVControlApp {
     }
     
     fn update_fsd(&mut self) {
-        // FSD only active when auto_mode is on and we have an active route
-        if !self.state.auto_mode || !self.state.nav_active {
+        // FSD needs both auto_mode and nav_active with a route
+        if !self.state.auto_mode {
+            return;
+        }
+        
+        // If no active navigation, just idle (don't move randomly)
+        if !self.state.nav_active || self.nav.route.is_none() {
+            self.state.speed_estimate = 0.0;
             return;
         }
         
@@ -1067,10 +1087,19 @@ impl EVControlApp {
             
             // In GPS mode with cameras, we would add obstacle detection here
             if !self.state.sim_mode {
-                // TODO: Check camera feeds for obstacles
-                // For now, just use basic navigation
                 self.check_camera_obstacles();
             }
+        } else {
+            // No waypoint to steer to - might need to recalculate route
+            self.state.throttle = 0.0;
+            self.log("FSD: No path - recalculating...");
+            if let Some((dest_lat, dest_lon)) = self.state.nav_target {
+                if !self.nav.calculate_route(self.state.lat, self.state.lon, dest_lat, dest_lon) {
+                    self.log("Could not find route");
+                    self.state.nav_active = false;
+                }
+            }
+            return;
         }
         
         // Update position in SIM mode
@@ -1227,16 +1256,18 @@ impl EVControlApp {
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     // Perform search - clone query to avoid borrow conflict
                     let query = self.nav.search_query.clone();
-                    self.nav.search_results = self.nav.geocode_search(&query);
+                    let (lat, lon) = (self.state.lat, self.state.lon);
+                    self.nav.search_results = self.nav.geocode_search(&query, lat, lon);
                     if !self.nav.search_results.is_empty() {
-                        self.log(&format!("Found {} results", self.nav.search_results.len()));
+                        self.log(&format!("Found {} results (nearest first)", self.nav.search_results.len()));
                     } else {
                         self.log("No results found");
                     }
                 }
                 if ui.button("Search").clicked() {
                     let query = self.nav.search_query.clone();
-                    self.nav.search_results = self.nav.geocode_search(&query);
+                    let (lat, lon) = (self.state.lat, self.state.lon);
+                    self.nav.search_results = self.nav.geocode_search(&query, lat, lon);
                 }
             });
             
@@ -1314,12 +1345,12 @@ impl EVControlApp {
             painter.rect_filled(rect, 4.0, Color32::from_gray(60));
         }
         
+        let center = rect.center();
+        let zoom = self.map_cache.zoom as f64;
+        let scale = 256.0 * 2_f64.powi(zoom as i32) / 360.0; // pixels per degree (approximate)
+        
         // Draw route if active
         if let Some(ref route) = self.nav.route {
-            let center = rect.center();
-            let zoom = self.map_cache.zoom as f64;
-            let scale = 256.0 * 2_f64.powi(zoom as i32) / 360.0; // pixels per degree (approximate)
-            
             // Draw route line segments with path type coloring
             for i in 0..route.waypoints.len().saturating_sub(1) {
                 let (lat1, lon1) = route.waypoints[i];
@@ -1344,21 +1375,36 @@ impl EVControlApp {
                 let width = if i == route.current_index { 4.0 } else { 2.0 };
                 painter.line_segment([p1, p2], Stroke::new(width, color));
             }
+        }
+        
+        // Always draw destination marker if we have a nav target (even without route)
+        if let Some((dest_lat, dest_lon)) = self.state.nav_target {
+            let dx = ((dest_lon - self.state.lon) * scale * (self.state.lat.to_radians().cos())) as f32;
+            let dy = ((self.state.lat - dest_lat) * scale) as f32;
+            let dest_pos = Pos2::new(center.x + dx, center.y + dy);
             
-            // Draw destination marker
-            if let Some((dest_lat, dest_lon)) = self.state.nav_target {
-                let dx = ((dest_lon - self.state.lon) * scale * (self.state.lat.to_radians().cos())) as f32;
-                let dy = ((self.state.lat - dest_lat) * scale) as f32;
-                let dest_pos = Pos2::new(center.x + dx, center.y + dy);
-                
-                painter.circle_filled(dest_pos, 8.0, Color32::from_rgb(255, 100, 100));
-                painter.circle_stroke(dest_pos, 8.0, Stroke::new(2.0, Color32::WHITE));
-                painter.text(dest_pos + Vec2::new(0.0, -15.0), egui::Align2::CENTER_CENTER, "🎯", FontId::proportional(12.0), Color32::WHITE);
-            }
+            // Destination marker
+            painter.circle_filled(dest_pos, 10.0, Color32::from_rgb(255, 80, 80));
+            painter.circle_stroke(dest_pos, 10.0, Stroke::new(2.0, Color32::WHITE));
+            painter.text(dest_pos + Vec2::new(0.0, -18.0), egui::Align2::CENTER_CENTER, "🎯", FontId::proportional(14.0), Color32::WHITE);
+            
+            // Distance to destination
+            let dist = haversine_distance(self.state.lat, self.state.lon, dest_lat, dest_lon);
+            let dist_text = if dist < 1.0 {
+                format!("{:.0}m", dist * 1000.0)
+            } else {
+                format!("{:.1}km", dist)
+            };
+            painter.text(
+                dest_pos + Vec2::new(0.0, 18.0), 
+                egui::Align2::CENTER_CENTER, 
+                &dist_text, 
+                FontId::proportional(10.0), 
+                Color32::WHITE
+            );
         }
 
         // Vehicle marker (always on top)
-        let center = rect.center();
         let heading_rad = (self.state.heading - 90.0).to_radians();
         let arrow_len = 15.0;
         
@@ -1717,10 +1763,22 @@ impl eframe::App for EVControlApp {
             self.switch_camera = false;
         }
 
-        // Update vehicle - either manual or FSD
-        if self.state.auto_mode {
+        // Update vehicle - FSD with manual override, or pure manual
+        // Manual input always takes precedence
+        let manual_input = self.is_key_held(egui::Key::W) || 
+                          self.is_key_held(egui::Key::A) || 
+                          self.is_key_held(egui::Key::S) || 
+                          self.is_key_held(egui::Key::D) ||
+                          self.is_key_held(egui::Key::Space);
+        
+        if manual_input {
+            // Manual override - user is driving
+            self.update_controls();
+        } else if self.state.auto_mode && self.state.nav_active {
+            // FSD active with route
             self.update_fsd();
         } else {
+            // No auto, no input - just decay controls
             self.update_controls();
         }
         self.send_command();
