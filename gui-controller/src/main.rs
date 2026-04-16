@@ -538,14 +538,15 @@ fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 }
 
 fn calculate_bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f32 {
-    let lat1 = lat1.to_radians();
-    let lat2 = lat2.to_radians();
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
     let dlon = (lon2 - lon1).to_radians();
     
-    let x = dlon.cos() * lat2.cos();
-    let y = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+    // Standard bearing formula
+    let y = dlon.sin() * lat2_rad.cos();
+    let x = lat1_rad.cos() * lat2_rad.sin() - lat1_rad.sin() * lat2_rad.cos() * dlon.cos();
     
-    let bearing = x.atan2(y).to_degrees();
+    let bearing = y.atan2(x).to_degrees();
     ((bearing + 360.0) % 360.0) as f32
 }
 
@@ -1104,10 +1105,18 @@ impl EVControlApp {
         
         // Update position in SIM mode
         if self.state.sim_mode && self.state.throttle > 0.0 && !self.state.brake {
-            let speed_deg = (self.state.throttle * 0.3) as f64 * 0.00000005;
-            self.state.lat += speed_deg * (self.state.heading as f64).to_radians().cos();
-            self.state.lon += speed_deg * (self.state.heading as f64).to_radians().sin();
-            self.state.heading = (self.state.heading + self.state.steering * 0.005) % 360.0;
+            // Speed: ~0.00001 degrees/frame at full throttle ≈ ~1m/frame at 60fps ≈ 60m/s max
+            // Adjusted for reasonable demo speeds
+            let speed_deg = (self.state.throttle / 100.0) as f64 * 0.00002;
+            
+            // Move in heading direction (heading 0 = North = +lat, 90 = East = +lon)
+            let heading_rad = (self.state.heading as f64).to_radians();
+            self.state.lat += speed_deg * heading_rad.cos();
+            self.state.lon += speed_deg * heading_rad.sin() / self.state.lat.to_radians().cos().max(0.01);
+            
+            // Turn rate: at full steering (100), turn ~2 degrees per frame
+            let turn_rate = self.state.steering * 0.02;
+            self.state.heading = (self.state.heading + turn_rate) % 360.0;
             if self.state.heading < 0.0 {
                 self.state.heading += 360.0;
             }

@@ -1,11 +1,14 @@
 /**
  * EV Prototype - ESP32 Controller
- * Texas A&M Senior Design - Crunch Time Edition
+ * Texas A&M FLiNT - Team Autopilot
  * 
  * Receives JSON commands via USB Serial, controls:
  * - Throttle (DAC → motor controller BROWN wire)
- * - Steering (PWM → motor driver)
+ * - Steering (L298N H-Bridge → AndyMark AM-3637 NeveRest 20)
  * - Brake (GPIO → motor controller PURPLE wire)
+ * 
+ * Steering motor: 12V DC, controlled via L298N
+ * - IN1/IN2 control direction, ENA controls speed via PWM
  */
 
 #include <ArduinoJson.h>
@@ -13,8 +16,16 @@
 // Pins - ALL TOP ROW (column j on breadboard)
 #define THROTTLE_DAC 25      // DAC output (row 8) → controller BROWN
 #define BRAKE_PIN 32         // Active LOW (row 10) → controller PURPLE
-#define STEER_A 26           // Steering motor (row 7) → driver IN1
-#define STEER_B 27           // Steering motor (row 6) → driver IN2
+
+// L298N Steering Control
+#define STEER_IN1 26         // L298N IN1 (row 7) - direction A
+#define STEER_IN2 27         // L298N IN2 (row 6) - direction B  
+#define STEER_ENA 33         // L298N ENA (row 9) - PWM speed control
+
+// Steering state tracking
+int current_steering = 0;    // -100 to +100
+unsigned long last_steer_cmd = 0;
+const unsigned long STEER_TIMEOUT_MS = 200;  // Stop steering if no commands
 
 String buffer = "";
 
@@ -22,21 +33,25 @@ void setup() {
     Serial.begin(115200);
     while (!Serial) delay(10);  // Wait for USB connection
     
+    // Brake setup
     pinMode(BRAKE_PIN, OUTPUT);
     digitalWrite(BRAKE_PIN, HIGH);  // HIGH = brake OFF
     
-    // Steering PWM setup
-    ledcSetup(0, 5000, 8);
-    ledcSetup(1, 5000, 8);
-    ledcAttachPin(STEER_A, 0);
-    ledcAttachPin(STEER_B, 1);
+    // L298N steering setup
+    pinMode(STEER_IN1, OUTPUT);
+    pinMode(STEER_IN2, OUTPUT);
+    digitalWrite(STEER_IN1, LOW);
+    digitalWrite(STEER_IN2, LOW);
+    
+    // PWM for steering speed (ENA)
+    ledcSetup(0, 5000, 8);  // Channel 0, 5kHz, 8-bit
+    ledcAttachPin(STEER_ENA, 0);
     
     // Start safe
     dacWrite(THROTTLE_DAC, 0);
     ledcWrite(0, 0);
-    ledcWrite(1, 0);
     
-    Serial.println("ESP32 EV Ready");
+    Serial.println("ESP32 EV Ready (L298N Steering)");
     Serial.println("Commands: {\"t\":0-100, \"s\":-100 to 100, \"b\":true/false}");
 }
 
@@ -48,16 +63,36 @@ void setThrottle(int pct) {
 
 void setSteering(int val) {
     val = constrain(val, -100, 100);
-    int spd = map(abs(val), 0, 100, 0, 255);
+    current_steering = val;
+    last_steer_cmd = millis();
     
-    if (val > 10) {
-        ledcWrite(0, spd); ledcWrite(1, 0);
-    } else if (val < -10) {
-        ledcWrite(0, 0); ledcWrite(1, spd);
+    int speed = map(abs(val), 0, 100, 0, 255);
+    
+    // Dead zone to prevent jitter
+    if (abs(val) < 5) {
+        // Stop motor
+        digitalWrite(STEER_IN1, LOW);
+        digitalWrite(STEER_IN2, LOW);
+        ledcWrite(0, 0);
+    } else if (val > 0) {
+        // Turn right
+        digitalWrite(STEER_IN1, HIGH);
+        digitalWrite(STEER_IN2, LOW);
+        ledcWrite(0, speed);
     } else {
-        ledcWrite(0, 0); ledcWrite(1, 0);
+        // Turn left
+        digitalWrite(STEER_IN1, LOW);
+        digitalWrite(STEER_IN2, HIGH);
+        ledcWrite(0, speed);
     }
     Serial.printf("S:%d\n", val);
+}
+
+void stopSteering() {
+    digitalWrite(STEER_IN1, LOW);
+    digitalWrite(STEER_IN2, LOW);
+    ledcWrite(0, 0);
+    current_steering = 0;
 }
 
 void setBrake(bool on) {
@@ -75,6 +110,7 @@ void processCommand(String& json) {
 }
 
 void loop() {
+    // Read serial commands
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '\n') {
@@ -83,5 +119,12 @@ void loop() {
         } else {
             buffer += c;
         }
+    }
+    
+    // Safety: stop steering if no commands received recently
+    // This prevents runaway steering if connection lost
+    if (current_steering != 0 && (millis() - last_steer_cmd > STEER_TIMEOUT_MS)) {
+        stopSteering();
+        Serial.println("STEER_TIMEOUT");
     }
 }

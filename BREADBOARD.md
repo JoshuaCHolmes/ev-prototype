@@ -5,13 +5,12 @@
 - **ESP32:** USB-C facing LEFT, pins in columns a (bottom row) and i (top row)
 - **Breadboard:** `+ - | a b c d e | f g h i j | + -`
 - **Power:** ESP32 powered via USB-C from PC
-- **Motor Controller:** VEVOR BY15WF01-A
-- **Steering Motor:** Small DC motor (~1-1.5" diameter) with RED and BLACK wires
+- **Motor Controller:** VEVOR BY15WF01-A (48V system)
+- **Steering Motor:** AndyMark AM-3637 NeveRest 20 (12V DC with encoder)
+- **Steering Driver:** L298N H-Bridge module
 - **Steering Control:** Manual centering (motor runs while key held, stops when released)
 
-ESP32 body covers columns a through i. **Only column j is accessible for wiring** (adjacent to the top row pins D25, D26, D27, D32 that we need).
-
-⚠️ **NEED:** Motor driver board (L298N, TB6612, or similar) for steering motor
+ESP32 body covers columns a through i. **Only column j is accessible for wiring** (adjacent to the top row pins D25, D26, D27, D32, D33 that we need).
 
 ---
 
@@ -56,7 +55,7 @@ STEP 2: Connect motor controller GNDs to the same (-) rail
     ═══════════════════════  ← Breadboard (-) rail
            ▲           ▲
            │           │
-     Wire #2      Wire #3
+     Wire #6      Wire #7
            │           │
     Throttle       Brake
     BLACK wire    BLACK wire
@@ -64,16 +63,15 @@ STEP 2: Connect motor controller GNDs to the same (-) rail
     controller)   controller)
 
 
-STEP 3: Connect motor driver GND (when you get one)
-───────────────────────────────────────────────────
+STEP 3: Connect L298N GND
+─────────────────────────
 
     ═══════════════════════  ← Breadboard (-) rail
                        ▲
                        │
-                  Wire #4
+                  Wire #8
                        │
-                Motor driver
-                  GND pin
+                L298N GND pin
 
 
 FINAL RESULT - All grounds connected:
@@ -83,11 +81,11 @@ FINAL RESULT - All grounds connected:
     ════════════════════════════════════════════════
          ▲              ▲              ▲         ▲
          │              │              │         │
-      Wire #1        Wire #2        Wire #3   Wire #4
+      Wire #1        Wire #6        Wire #7   Wire #8
          │              │              │         │
-      ESP32          Throttle       Brake     Motor
-       GND           BLACK          BLACK     Driver
-     (row 2)         wire           wire       GND
+      ESP32          Throttle       Brake     L298N
+       GND           BLACK          BLACK       GND
+     (row 2)         wire           wire
 
 
 WHY THIS WORKS:
@@ -96,7 +94,7 @@ WHY THIS WORKS:
 • When ESP32 outputs 3.3V on D25, the motor controller 
   measures 3.3V between BROWN wire and its BLACK wire
 • Same for brake signal on D32/PURPLE
-• The motor driver also shares ground so steering signals work
+• The L298N also shares ground so steering signals work
 ```
 
 ---
@@ -119,11 +117,11 @@ BREADBOARD TOP VIEW
     3  │ │D15 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D13 │ │  ○    │
     4  │ │D2  │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D12 │ │  ○    │
     5  │ │D4  │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D14 │ │  ○    │
-    6  │ │RX2 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D27 │ │  ●5   │ ← STEER B (to driver IN2)
-    7  │ │TX2 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D26 │ │  ●4   │ ← STEER A (to driver IN1)
+    6  │ │RX2 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D27 │ │  ●4   │ ← L298N IN2
+    7  │ │TX2 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D26 │ │  ●3   │ ← L298N IN1
     8  │ │D5  │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D25 │ │  ●2   │ ← THROTTLE (to BROWN)
-    9  │ │D18 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D33 │ │  ○    │
-   10  │ │D19 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D32 │ │  ●3   │ ← BRAKE (to PURPLE)
+    9  │ │D18 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D33 │ │  ●5   │ ← L298N ENA (PWM speed)
+   10  │ │D19 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D32 │ │  ●6   │ ← BRAKE (to PURPLE)
    11  │ │RX0 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D35 │ │  ○    │
    12  │ │TX0 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│D34 │ │  ○    │
    13  │ │D22 │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒║▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│VN  │ │  ○    │
@@ -136,9 +134,10 @@ BREADBOARD TOP VIEW
 
 ●1 = Wire 1: GND → (-) rail
 ●2 = Wire 2: D25 → Motor controller BROWN wire  
-●3 = Wire 3: D32 → Motor controller PURPLE wire
-●4 = Wire 4: D26 → Motor driver IN1
-●5 = Wire 5: D27 → Motor driver IN2
+●3 = Wire 3: D26 → L298N IN1
+●4 = Wire 4: D27 → L298N IN2
+●5 = Wire 5: D33 → L298N ENA (PWM for speed control)
+●6 = Wire 6: D32 → Motor controller PURPLE wire
 ○  = Unused  
 ▒  = BLOCKED by ESP32 body
 ```
@@ -147,21 +146,74 @@ BREADBOARD TOP VIEW
 
 ## Complete Wire List
 
+### ESP32 to Devices
+
 | Wire # | From (ESP32) | Row | Col | To (Destination) | Wire Color Suggestion |
 |--------|--------------|-----|-----|------------------|----------------------|
-| 1 | **GND** | 2 | a | Breadboard (-) rail | Black |
-| 2 | **D25** | 8 | a | Motor controller **BROWN** | Brown or Orange |
-| 3 | **D32** | 10 | a | Motor controller **PURPLE** | Purple or Blue |
-| 4 | **D26** | 7 | a | Motor driver **IN1** | Yellow |
-| 5 | **D27** | 6 | a | Motor driver **IN2** | Green |
+| 1 | **GND** | 2 | j | Breadboard (-) rail | Black |
+| 2 | **D25** | 8 | j | Motor controller **BROWN** | Brown or Orange |
+| 3 | **D26** | 7 | j | L298N **IN1** | Yellow |
+| 4 | **D27** | 6 | j | L298N **IN2** | Green |
+| 5 | **D33** | 9 | j | L298N **ENA** | Blue |
+| 6 | **D32** | 10 | j | Motor controller **PURPLE** | Purple |
 
-**From (-) rail to devices (ground wires):**
+### Ground Connections (all to (-) rail)
 
 | Wire # | From | To | Notes |
 |--------|------|----|-------|
-| 6 | (-) rail | Throttle connector BLACK wire | Share ground with motor controller |
-| 7 | (-) rail | Brake connector BLACK wire | Share ground with motor controller |
-| 8 | (-) rail | Motor driver GND | When you get a driver board |
+| 7 | (-) rail | Throttle connector BLACK wire | Motor controller GND |
+| 8 | (-) rail | Brake connector BLACK wire | Motor controller GND |
+| 9 | (-) rail | L298N **GND** | Steering driver GND |
+
+---
+
+## L298N Wiring Diagram (AndyMark AM-3637 NeveRest 20)
+
+```
+L298N MODULE PINOUT
+═══════════════════════════════════════════════════════════════════
+
+      ┌─────────────────────────────────────────────────┐
+      │                                                 │
+      │    ┌─────────────────────────────────────┐      │
+      │    │         [HEAT SINK]                 │      │
+      │    └─────────────────────────────────────┘      │
+      │                                                 │
+      │   MOTOR A           POWER           MOTOR B     │
+      │  OUT1  OUT2      +12V  GND        OUT3  OUT4    │
+      │   │     │         │     │          │     │      │
+      └───┼─────┼─────────┼─────┼──────────┼─────┼──────┘
+          │     │         │     │          │     │
+          │     │         │     │          (unused)
+          ▼     ▼         ▼     ▼
+        NeveRest       12V    (-) rail
+        RED  BLACK    supply  (Wire #9)
+        wire wire
+
+
+        ┌─────────────────────────────────────────────────┐
+        │                                                 │
+        │    ENA   IN1   IN2   IN3   IN4   ENB   +5V     │
+        │     │     │     │     │     │     │     │      │
+        └─────┼─────┼─────┼─────┼─────┼─────┼─────┼──────┘
+              │     │     │     │     │     │     │
+              │     │     │   (unused - Motor B)  │
+              │     │     │                       │
+              ▼     ▼     ▼                       ▼
+            D33   D26   D27                   (leave open or
+          Wire#5 Wire#3 Wire#4                 jumper to ENA)
+
+
+SIGNAL TRUTH TABLE:
+───────────────────
+  ENA   IN1   IN2   │  MOTOR ACTION
+══════════════════════════════════════
+  LOW   X     X     │  Motor OFF (coasts)
+  PWM   HIGH  LOW   │  Turn RIGHT at PWM speed
+  PWM   LOW   HIGH  │  Turn LEFT at PWM speed
+  PWM   HIGH  HIGH  │  Brake (motor stops fast)
+  PWM   LOW   LOW   │  Motor OFF (coasts)
+```
 
 ---
 
@@ -184,72 +236,48 @@ ACTIVE CONNECTIONS (from ESP32):
 THROTTLE CONNECTOR (3 thin wires):
 ┌─────────────────────────────────┐
 │  RED ──── +4.3V (leave alone)   │
-│  BLACK ── GND ◄── Wire #6 from (-) rail
+│  BLACK ── GND ◄── Wire #7 from (-) rail
 │  BROWN ── Signal ◄── Wire #2 from D25 (row 8)
 └─────────────────────────────────┘
 
 BRAKE CONNECTOR (2 thin wires):  
 ┌─────────────────────────────────┐
-│  PURPLE ── Signal ◄── Wire #3 from D32 (row 10)
-│  BLACK ─── GND ◄── Wire #7 from (-) rail
+│  PURPLE ── Signal ◄── Wire #6 from D32 (row 10)
+│  BLACK ─── GND ◄── Wire #8 from (-) rail
 └─────────────────────────────────┘
 ```
 
 ---
 
-## Steering Motor Driver (NEED TO FIND)
+## Power Requirements
 
-You need an H-bridge motor driver. Look for these at the makerspace:
+### 48V System (Main Drive Motor)
+- **Source:** 48V 10000mAh battery
+- **Connection:** Already connected to BY15WF01-A motor controller
 
-```
-COMMON MOTOR DRIVERS:
-─────────────────────
+### 12V System (Steering Motor - AM-3637 NeveRest 20)
+- **Required:** 12V DC, ~3A capability (2.7A stall)
+- **Options:**
+  1. **DC-DC Buck Converter** (48V → 12V) - Most elegant
+  2. **Separate 12V battery** (e.g., 3S LiPo = 11.1V)
+  3. **12V power supply** if testing on bench
 
-L298N (most common)          TB6612 (smaller)         L293D (chip or board)
-┌──────────────────┐        ┌──────────────┐         ┌──────────────┐
-│  [HEATSINK]      │        │  Small board │         │  DIP chip or │
-│                  │        │  ~1" x 1"    │         │  small board │
-│  Red PCB         │        │              │         │              │
-│  ~2" x 2"        │        │              │         │              │
-└──────────────────┘        └──────────────┘         └──────────────┘
-
-Any of these will work!
-
-WIRING THE MOTOR DRIVER:
-────────────────────────
-
-┌─────────────────────────────────────────────────────┐
-│                   MOTOR DRIVER                      │
-│                                                     │
-│   CONTROL SIDE:              MOTOR SIDE:            │
-│   ─────────────              ───────────            │
-│   IN1 ◄── D26 (row 7)        OUT1 ──► Steering motor RED
-│   IN2 ◄── D27 (row 6)        OUT2 ──► Steering motor BLACK
-│   GND ◄── (-) rail                                  │
-│                                                     │
-│   POWER SIDE:                                       │
-│   ────────────                                      │
-│   VCC/12V ◄── 12V power supply (or 5V-24V depending │
-│   GND ◄────── (-) rail           on your motor)     │
-│                                                     │
-└─────────────────────────────────────────────────────┘
-
-NOTE: The steering motor needs its own power supply!
-      ESP32 can't power it. The motor driver just
-      switches that power on/off based on ESP32 signals.
-```
+⚠️ **DO NOT** connect the NeveRest motor directly to ESP32 - it will damage the ESP32!
 
 ---
 
 ## Steering Behavior
 
-**Current implementation:** Manual centering
+**Current implementation:** Manual centering with timeout safety
 - Hold A → Motor spins left
 - Hold D → Motor spins right  
 - Release → Motor stops, wheel stays where it is
+- If no commands for 200ms → Motor automatically stops (safety feature)
 
 The steering doesn't auto-center because we have no position sensor.
 This is fine for the prototype - just manually center before stopping.
+
+**FSD Mode:** The system calculates bearing to next waypoint and sends steering commands automatically. Manual input (A/D keys) always overrides FSD.
 
 ---
 
@@ -259,19 +287,25 @@ This is fine for the prototype - just manually center before stopping.
 
 - [ ] ESP32 GND (row 2, col j) → (-) rail
 - [ ] D25 (row 8, col j) → Motor controller BROWN wire
+- [ ] D26 (row 7, col j) → L298N IN1
+- [ ] D27 (row 6, col j) → L298N IN2
+- [ ] D33 (row 9, col j) → L298N ENA
 - [ ] D32 (row 10, col j) → Motor controller PURPLE wire
 - [ ] (-) rail → Throttle connector BLACK wire
 - [ ] (-) rail → Brake connector BLACK wire
-- [ ] Motor driver found and connected (IN1, IN2, GND, power)
-- [ ] Steering motor connected to motor driver outputs
+- [ ] (-) rail → L298N GND
+- [ ] L298N +12V → 12V power source (NOT 48V!)
+- [ ] L298N OUT1 → NeveRest RED wire
+- [ ] L298N OUT2 → NeveRest BLACK wire
 - [ ] ESP32 connected to PC via USB-C
 - [ ] 48V battery connected to motor controller (RED=B+, BLACK=B-)
 
 **Testing order:**
 
-1. Connect ESP32 to PC only (no motor controller power)
-2. Run TUI, verify ESP32 responds
-3. Connect motor controller power (48V)
-4. Test throttle carefully (low values first!)
-5. Test brake
-6. Test steering (once motor driver is connected)
+1. Connect ESP32 to PC only (no motor controller power, no L298N power)
+2. Run GUI, verify ESP32 responds
+3. Connect 12V to L298N, test steering with A/D keys
+4. Connect 48V to motor controller
+5. Test throttle carefully (low values first!)
+6. Test brake
+7. Test FSD mode (SIM mode first, then GPS)
