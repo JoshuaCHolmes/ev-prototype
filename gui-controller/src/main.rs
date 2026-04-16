@@ -691,7 +691,7 @@ struct SerialController {
 }
 
 // Expected firmware version - update when ESP32 code changes
-const EXPECTED_FIRMWARE_VERSION: &str = "1.5.6";
+const EXPECTED_FIRMWARE_VERSION: &str = "1.5.7";
 
 impl SerialController {
     fn new() -> Self {
@@ -1066,7 +1066,7 @@ impl EVControlApp {
         {
             let mut l = logs.lock().unwrap();
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));
-            l.push(format!("[{}] EV Prototype Control Center v1.5.6", timestamp()));
+            l.push(format!("[{}] EV Prototype Control Center v1.5.7", timestamp()));
             l.push(format!("[{}] Texas A&M FLiNT - Team Autopilot", timestamp()));
             l.push(format!("[{}] Microtransport FSD - Sidewalk Priority", timestamp()));
             l.push(format!("[{}] ═══════════════════════════════════════", timestamp()));

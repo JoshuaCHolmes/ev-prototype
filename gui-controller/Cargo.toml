@@ -1,6 +1,6 @@
 [package]
 name = "ev-control-gui"
-version = "1.5.6"
+version = "1.5.7"
 edition = "2021"
 description = "EV Prototype Control Center - Windows GUI with FSD"
 authors = ["Texas A&M FLiNT - Team Autopilot"]
